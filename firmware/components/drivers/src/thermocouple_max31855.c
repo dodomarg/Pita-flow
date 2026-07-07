@@ -8,6 +8,24 @@ static const char *TAG = "max31855";
 static spi_device_handle_t s_spi_device;
 static bool s_initialized = false;
 
+/* MAX31855 32-bit output register bit layout (see datasheet Table 1/2). */
+#define MAX31855_FAULT_BIT (1u << 16)
+#define MAX31855_FAULT_SCV_BIT (1u << 2) /* Short to VCC */
+#define MAX31855_FAULT_SCG_BIT (1u << 1) /* Short to GND */
+#define MAX31855_FAULT_OC_BIT (1u << 0)  /* Open circuit */
+
+#define MAX31855_TC_SHIFT 18
+#define MAX31855_TC_BITS 14
+#define MAX31855_TC_MASK 0x3FFF
+#define MAX31855_TC_SIGN_BIT 0x2000
+#define MAX31855_TC_LSB_C 0.25f
+
+#define MAX31855_REF_SHIFT 4
+#define MAX31855_REF_BITS 12
+#define MAX31855_REF_MASK 0xFFF
+#define MAX31855_REF_SIGN_BIT 0x800
+#define MAX31855_REF_LSB_C 0.0625f
+
 esp_err_t thermocouple_max31855_init(const thermocouple_max31855_config_t *config)
 {
     if (config == NULL) {
@@ -74,24 +92,24 @@ esp_err_t thermocouple_max31855_read(thermocouple_max31855_reading_t *out_readin
 
     memset(out_reading, 0, sizeof(*out_reading));
 
-    out_reading->fault = (raw & (1u << 16)) != 0;
-    out_reading->fault_open_circuit = (raw & (1u << 0)) != 0;
-    out_reading->fault_short_to_gnd = (raw & (1u << 1)) != 0;
-    out_reading->fault_short_to_vcc = (raw & (1u << 2)) != 0;
+    out_reading->fault = (raw & MAX31855_FAULT_BIT) != 0;
+    out_reading->fault_open_circuit = (raw & MAX31855_FAULT_OC_BIT) != 0;
+    out_reading->fault_short_to_gnd = (raw & MAX31855_FAULT_SCG_BIT) != 0;
+    out_reading->fault_short_to_vcc = (raw & MAX31855_FAULT_SCV_BIT) != 0;
 
     /* Bits 31..18: 14-bit signed thermocouple temperature, 0.25 C/LSB. */
-    int32_t tc_raw = (int32_t)(raw >> 18) & 0x3FFF;
-    if (tc_raw & 0x2000) {
-        tc_raw |= ~0x3FFF; /* sign-extend 14-bit value */
+    int32_t tc_raw = (int32_t)(raw >> MAX31855_TC_SHIFT) & MAX31855_TC_MASK;
+    if (tc_raw & MAX31855_TC_SIGN_BIT) {
+        tc_raw |= ~MAX31855_TC_MASK; /* sign-extend 14-bit value */
     }
-    out_reading->chamber_temperature_c = (float)tc_raw * 0.25f;
+    out_reading->chamber_temperature_c = (float)tc_raw * MAX31855_TC_LSB_C;
 
     /* Bits 15..4: 12-bit signed internal (cold-junction) reference, 0.0625 C/LSB. */
-    int32_t ref_raw = (int32_t)(raw >> 4) & 0xFFF;
-    if (ref_raw & 0x800) {
-        ref_raw |= ~0xFFF; /* sign-extend 12-bit value */
+    int32_t ref_raw = (int32_t)(raw >> MAX31855_REF_SHIFT) & MAX31855_REF_MASK;
+    if (ref_raw & MAX31855_REF_SIGN_BIT) {
+        ref_raw |= ~MAX31855_REF_MASK; /* sign-extend 12-bit value */
     }
-    out_reading->internal_reference_c = (float)ref_raw * 0.0625f;
+    out_reading->internal_reference_c = (float)ref_raw * MAX31855_REF_LSB_C;
 
     return ESP_OK;
 }

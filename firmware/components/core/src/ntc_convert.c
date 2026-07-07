@@ -59,10 +59,10 @@ int ntc_reading_is_implausible(uint32_t raw_adc, uint32_t adc_max, uint32_t marg
         margin_counts = adc_max;
     }
     if (raw_adc <= margin_counts) {
-        return 1; /* Near/at zero rail: likely open-circuit NTC (pulled down) */
+        return 1; /* Near/at zero rail: open-circuit NTC leaves the node pulled to GND by the pulldown resistor */
     }
     if (raw_adc >= (adc_max - margin_counts)) {
-        return 1; /* Near/at full-scale rail: likely shorted NTC (pulled to supply) */
+        return 1; /* Near/at full-scale rail: shorted/near-zero-ohm NTC pulls the node up towards the 3.3V supply */
     }
     return 0;
 }

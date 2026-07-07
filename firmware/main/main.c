@@ -143,24 +143,19 @@ static void control_task(void *arg)
         inputs.ms_since_last_control_tick = ms_since_last;
         inputs.system_is_idle_or_fault = (s_profile_engine.state == PROFILE_ENGINE_STATE_IDLE ||
                                            s_profile_engine.state == PROFILE_ENGINE_STATE_FAULT);
-        inputs.relay_commanded_on = 0; /* Updated below once demand is known. */
         inputs.active_profile_valid = (s_profile_engine.active_profile != NULL) &&
                                        profile_engine_validate(s_profile_engine.active_profile);
 
+        /* First pass: evaluate sensor/watchdog/profile faults before any relay
+         * decision has been made (relay_commanded_on is necessarily 0 here). */
         uint32_t faults = safety_evaluate(&inputs, &safety_limits);
 
         float top_power_percent = 0.0f;
         float bottom_power_percent = 0.0f;
+        int top_on = 0;
+        int bottom_on = 0;
 
-        if (faults != SAFETY_FAULT_NONE || phase == NULL) {
-            relay_output_force_all_off();
-            heater_control_reset(&s_top_heater_ctrl);
-            heater_control_reset(&s_bottom_heater_ctrl);
-            if (faults != SAFETY_FAULT_NONE) {
-                profile_engine_force_fault(&s_profile_engine);
-                ESP_LOGE(TAG, "Safety fault detected: 0x%02" PRIx32, faults);
-            }
-        } else {
+        if (faults == SAFETY_FAULT_NONE && phase != NULL) {
             float target_c = profile_engine_current_target_c(&s_profile_engine, previous_phase_target_c);
             float dt_s = (float)CONTROL_TASK_PERIOD_MS / 1000.0f;
 
@@ -187,9 +182,27 @@ static void control_task(void *arg)
             uint32_t top_on_ms = relay_timing_on_ms(top_power_percent, s_config.relay_window_ms);
             uint32_t bottom_on_ms = relay_timing_on_ms(bottom_power_percent, s_config.relay_window_ms);
 
-            int top_on = relay_timing_should_energize(window_elapsed_ms, top_on_ms);
-            int bottom_on = relay_timing_should_energize(window_elapsed_ms, bottom_on_ms);
+            top_on = relay_timing_should_energize(window_elapsed_ms, top_on_ms);
+            bottom_on = relay_timing_should_energize(window_elapsed_ms, bottom_on_ms);
+        }
 
+        /* Second pass: re-evaluate with the actual intended relay command now
+         * known, so SAFETY_FAULT_RELAY_COMMANDED_WHILE_IDLE can catch a
+         * software bug that would otherwise energize a relay while the
+         * system is idle/faulted (defense-in-depth; this path should never
+         * be reachable given the gating above, but is checked regardless). */
+        inputs.relay_commanded_on = top_on || bottom_on;
+        faults |= safety_evaluate(&inputs, &safety_limits);
+
+        if (faults != SAFETY_FAULT_NONE) {
+            relay_output_force_all_off();
+            heater_control_reset(&s_top_heater_ctrl);
+            heater_control_reset(&s_bottom_heater_ctrl);
+            top_power_percent = 0.0f;
+            bottom_power_percent = 0.0f;
+            profile_engine_force_fault(&s_profile_engine);
+            ESP_LOGE(TAG, "Safety fault detected: 0x%02" PRIx32, faults);
+        } else {
             relay_output_set(RELAY_OUTPUT_TOP_HEATER, top_on);
             relay_output_set(RELAY_OUTPUT_BOTTOM_HEATER, bottom_on);
         }
@@ -244,6 +257,12 @@ void app_main(void)
         ESP_LOGE(TAG, "Built-in profile failed validation; refusing to start");
         return;
     }
+    /* NOTE: this milestone auto-starts the built-in profile on boot (there is
+     * no persisted "idle until commanded" state yet, and /api/run/start is
+     * not implemented). This means heaters begin cycling immediately on
+     * power-up. Milestone 11 (editable/custom profile support, tracked in
+     * docs/firmware-plan.md) should replace this with idle-by-default
+     * behavior gated on the /api/run/start endpoint. */
     profile_engine_start(&s_profile_engine);
 
     s_status_mutex = xSemaphoreCreateMutex();
