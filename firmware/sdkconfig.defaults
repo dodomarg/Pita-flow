@@ -1,0 +1,9 @@
+# Target: ESP32-C3 Super Mini (ESP32-C3FH4-based board), see
+# docs/firmware-plan.md "Platform".
+CONFIG_IDF_TARGET="esp32c3"
+
+# Fail-safe boot: keep watchdogs enabled.
+CONFIG_ESP_TASK_WDT_EN=y
+
+# NVS is used by config_store for persisted configuration.
+CONFIG_NVS_ENCRYPTION=n

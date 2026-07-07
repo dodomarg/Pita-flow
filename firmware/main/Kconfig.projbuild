@@ -1,0 +1,17 @@
+menu "Pita-flow Configuration"
+
+    config PITA_FLOW_WIFI_SSID
+        string "Wi-Fi SSID"
+        default "myssid"
+        help
+            SSID (network name) for the reflow controller to connect to.
+            Wi-Fi connectivity is best-effort only: the heater control loop
+            must remain fully functional even if this network is unreachable.
+
+    config PITA_FLOW_WIFI_PASSWORD
+        string "Wi-Fi Password"
+        default "mypassword"
+        help
+            WPA2 passphrase for the SSID above.
+
+endmenu
