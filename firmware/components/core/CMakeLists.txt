@@ -1,0 +1,10 @@
+idf_component_register(
+    SRCS
+        "src/ntc_convert.c"
+        "src/relay_timing.c"
+        "src/heater_control.c"
+        "src/profile_engine.c"
+        "src/safety.c"
+    INCLUDE_DIRS
+        "include"
+)

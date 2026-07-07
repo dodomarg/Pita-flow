@@ -1,0 +1,13 @@
+idf_component_register(
+    SRCS
+        "src/thermocouple_max31855.c"
+        "src/plate_ntc.c"
+        "src/relay_output.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        core
+        driver
+        esp_adc
+        esp_common
+)

@@ -1,0 +1,17 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "built_in_profile.c"
+        "wifi_init.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        core
+        drivers
+        config_store
+        web_api
+        esp_wifi
+        esp_netif
+        esp_event
+        nvs_flash
+)
