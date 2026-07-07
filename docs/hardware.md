@@ -8,14 +8,14 @@ The design goal is stable, repeatable PCB reflow temperature control while keepi
 
 The oven has two independently controlled mains-voltage heaters:
 
-| Subsystem | Description | Power | Voltage | Primary role |
-|---|---:|---:|---:|---|
-| Bottom plate heater | Embedded heater under the plate | 800 W | 240 VAC / mains | Preheat and soak assist; limited by configurable plate-temperature ceiling |
-| Top chamber heater | Radiative quartz heater in chamber | 1000 W | Mains | Primary reflow heater, especially during solder reflow/liquidus phase |
+| Subsystem | Description | Power | Voltage | Switching device | Primary role |
+|---|---:|---:|---:|---|---|
+| Bottom plate heater | Embedded heater under the plate | 800 W | 240 VAC / mains | Mechanical relay | Preheat and soak assist; limited by configurable plate-temperature ceiling |
+| Top chamber heater | Radiative quartz heater in chamber | 1000 W | Mains | Solid-state relay (SSR) | Primary reflow heater, especially during solder reflow/liquidus phase |
 
-The two heaters are controlled by separate **mechanical relays**. Because the relays are mechanical, heater power control is done using **slow time-proportional PWM** with a nominal **1 second control window**.
+The bottom plate heater is switched using a **mechanical relay**, while the top quartz heater is switched using a **solid-state relay (SSR)**. Both channels use **slow time-proportional PWM** with a nominal **1 second control window** for consistency, even though the SSR is capable of much faster switching; this keeps the bottom heater's mechanical relay within a reasonable switching-cycle lifetime and keeps the control scheme identical for both channels.
 
-> Safety note: this project controls mains-voltage heaters. Relay drive, isolation, fusing, grounding, enclosure, wiring clearances, strain relief, and emergency shutdown must be designed and reviewed appropriately before hardware is energized.
+> Safety note: this project controls mains-voltage heaters. Relay and SSR drive, isolation, fusing, grounding, enclosure, wiring clearances, strain relief, SSR heatsinking, and emergency shutdown must be designed and reviewed appropriately before hardware is energized.
 
 ## Sensors and Safety Devices
 
@@ -50,23 +50,35 @@ The current pinout avoids using boot-sensitive strapping pins for heater relay o
 | MAX31855 MISO / SO | GPIO5 | Input | MAX31855 is read-only; no MOSI required |
 | MAX31855 CS | GPIO6 | Output | Thermocouple chip select |
 | Plate NTC ADC | GPIO0 / ADC1_CH0 | Input | Voltage divider input for 100K NTC |
-| Bottom heater relay drive | GPIO7 | Output | Time-proportional relay control; must default safe/off |
-| Top heater relay drive | GPIO10 | Output | Time-proportional relay control; must default safe/off |
+| Bottom heater relay drive | GPIO7 | Output | Time-proportional mechanical relay control; must default safe/off |
+| Top heater SSR drive | GPIO10 | Output | Time-proportional SSR control; must default safe/off |
 | Optional I2C SDA | GPIO8 | I/O | Reserved for possible LCD/UI; strapping pin, use carefully |
 | Optional I2C SCL | GPIO9 | I/O | Reserved for possible LCD/UI; strapping pin, use carefully |
 | Optional button 1 | GPIO1 | Input | Future local UI input, preferably interrupt-capable |
 | Optional button 2 | GPIO3 | Input | Future local UI input, preferably interrupt-capable |
 | USB D- / D+ | GPIO18 / GPIO19 | Reserved | Native USB serial/JTAG/programming |
 
-### Relay Drive Requirements
+### Bottom Heater Relay Drive Requirements (Mechanical Relay)
 
-The ESP32-C3 pins must not drive relay coils directly. Each relay channel should include, as appropriate for the selected relay module or discrete circuit:
+The ESP32-C3 GPIO7 output must not drive the relay coil directly. The bottom heater relay channel should include, as appropriate for the selected relay module or discrete circuit:
 
 - transistor or MOSFET driver stage,
 - flyback diode for DC relay coils,
 - opto-isolation if using an isolated relay module,
 - defined default-off behavior during reset/boot,
 - adequate mains isolation between low-voltage and mains wiring.
+
+### Top Heater SSR Drive Requirements (Solid-State Relay)
+
+The ESP32-C3 GPIO10 output drives the top quartz heater through a solid-state relay (SSR) rather than a mechanical relay. Requirements differ from the mechanical relay channel:
+
+- series current-limiting resistor sized for the SSR's input LED, unless the selected SSR module already includes its own input conditioning circuitry,
+- prefer a zero-cross switching SSR to reduce electrical noise and inrush current, unless phase-angle control is intentionally required,
+- opto-isolation is inherent to the SSR itself, but low-voltage control wiring and mains-side output terminals must still be kept physically separated with adequate creepage/clearance,
+- adequate heatsinking for the SSR output stage, sized for the 1000 W load and expected duty cycle, since SSRs dissipate heat across their output junction unlike mechanical relay contacts,
+- snubber circuit (RC or MOV) across the SSR output if required by the manufacturer, particularly for inductive or high inrush loads,
+- defined default-off behavior during reset/boot (control line must not float high while the ESP32-C3 is booting/resetting),
+- confirm SSR current/voltage rating includes an appropriate safety margin above the 1000 W steady-state load current.
 
 ## Connection Diagram
 
@@ -78,7 +90,7 @@ flowchart LR
         GPIO5[GPIO5\nSPI MISO]
         GPIO6[GPIO6\nSPI CS]
         GPIO7[GPIO7\nBottom relay drive]
-        GPIO10[GPIO10\nTop relay drive]
+        GPIO10[GPIO10\nTop SSR drive]
         GPIO8[GPIO8\nOptional I2C SDA]
         GPIO9[GPIO9\nOptional I2C SCL]
         GPIO1[GPIO1\nOptional button]
@@ -94,9 +106,9 @@ flowchart LR
 
     subgraph Power[Heater Power]
         BRD[Bottom relay driver]
-        TRD[Top relay driver]
+        TRD[Top SSR driver]
         BR[Mechanical relay\nbottom heater]
-        TR[Mechanical relay\ntop heater]
+        TR[Solid-state relay\ntop heater]
         BH[800 W bottom plate heater\n240 VAC / mains]
         TH[1000 W quartz chamber heater\nmains]
         CUTOFF[250 °C thermal cutoff\nplate safety]
@@ -126,7 +138,8 @@ flowchart LR
 ## Open Hardware Decisions
 
 - Confirm exact ESP32-C3 module/dev board variant and available pins.
-- Confirm relay module electrical interface and whether inputs are active-high or active-low.
+- Confirm bottom heater mechanical relay module electrical interface and whether inputs are active-high or active-low.
+- Confirm top heater SSR part number, control input range/current, zero-cross vs random-fire switching, and heatsink requirements.
 - Define NTC divider resistor value, ADC attenuation, filtering, and calibration method.
 - Confirm LCD/display type if local UI is added.
 - Decide whether to add a buzzer, fan, door/cover switch, or emergency-stop input in a later revision.
