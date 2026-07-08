@@ -1,0 +1,61 @@
+profiles:
+  - name: leaded-default
+    phases:
+      - name: preheat
+        duration_s: 60
+        target_chamber_c: 150
+        ramp_rate_c_per_s: 1.5
+        bottom_heater_mode: limited
+        bottom_plate_limit_c: 150
+        top_heater_enabled: true
+      - name: soak
+        duration_s: 90
+        target_chamber_c: 170
+        ramp_rate_c_per_s: 0.5
+        bottom_heater_mode: limited
+        bottom_plate_limit_c: 150
+        top_heater_enabled: true
+      - name: reflow
+        duration_s: 60
+        target_chamber_c: 220
+        ramp_rate_c_per_s: 1.0
+        bottom_heater_mode: off
+        bottom_plate_limit_c: 0
+        top_heater_enabled: true
+      - name: cooldown
+        duration_s: 60
+        target_chamber_c: 50
+        ramp_rate_c_per_s: 2.0
+        bottom_heater_mode: off
+        bottom_plate_limit_c: 0
+        top_heater_enabled: false
+  - name: low-temp-alloy
+    phases:
+      - name: preheat
+        duration_s: 50
+        target_chamber_c: 135
+        ramp_rate_c_per_s: 1.2
+        bottom_heater_mode: limited
+        bottom_plate_limit_c: 135
+        top_heater_enabled: true
+      - name: soak
+        duration_s: 75
+        target_chamber_c: 155
+        ramp_rate_c_per_s: 0.4
+        bottom_heater_mode: limited
+        bottom_plate_limit_c: 135
+        top_heater_enabled: true
+      - name: reflow
+        duration_s: 45
+        target_chamber_c: 190
+        ramp_rate_c_per_s: 0.8
+        bottom_heater_mode: off
+        bottom_plate_limit_c: 0
+        top_heater_enabled: true
+      - name: cooldown
+        duration_s: 60
+        target_chamber_c: 45
+        ramp_rate_c_per_s: 1.5
+        bottom_heater_mode: off
+        bottom_plate_limit_c: 0
+        top_heater_enabled: false

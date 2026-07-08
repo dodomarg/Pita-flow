@@ -1,6 +1,8 @@
 # Firmware Plan
 
-This document describes the initial firmware architecture for Pita-flow, an ESP32-C3 based reflow oven controller.
+This document describes the firmware architecture for Pita-flow as it is being
+adapted toward a Wio Terminal-based local operator console while preserving a
+hardware-independent thermal-control core.
 
 The firmware should be designed around deterministic thermal control first. Wi-Fi, web UI, logging, calibration, and profile editing are important, but they must never compromise the heater-control loop or safety shutdown paths.
 
@@ -15,32 +17,27 @@ The firmware should be designed around deterministic thermal control first. Wi-F
 
 ## Platform
 
-- Microcontroller: ESP32-C3
-- Board/module: **ESP32-C3 Super Mini** (ESP32-C3FH4-based dev board)
-- Suggested framework: ESP-IDF
+- User-interface console: **Wio Terminal** (built-in screen, three buttons,
+  microSD slot, and speaker)
+- Thermal-control core: plain C modules in `firmware/components/core`
+- Current reference runtime/framework: ESP-IDF app kept temporarily while the
+  board-specific Wio Terminal bring-up is completed
 - Runtime: FreeRTOS
-- Connectivity: Wi-Fi
-- UI: lightweight web API first; optional local LCD/buttons later
+- Connectivity: optional; local operation must not depend on Wi-Fi
+- UI: Wio Terminal screen/buttons first, with web/API support remaining best-effort
 
-### ESP32-C3 Super Mini Pin Assignment
+### Wio Terminal Local Operator Resources
 
-The Super Mini breaks out GPIO0-10, 18, and 19. Suggested assignment (arbitrary GPIO SPI/ADC
-pin mapping is supported on ESP32-C3, so these can be adjusted in `config_store` defaults
-without firmware redesign):
+| Resource | Intended use |
+|---|---|
+| Built-in LCD | Current profile, phase, temperatures, fault state, and run prompts |
+| Left / center / right buttons | Previous profile, start/stop/acknowledge, next profile |
+| Built-in microSD slot | `reflow-profiles.yaml` catalog storage |
+| Built-in speaker | Short notification patterns for profile selection, phase changes, completion, and faults |
 
-| Signal | GPIO | Notes |
-|---|---|---|
-| MAX31855 SPI CLK | GPIO6 | HSPI default CLK |
-| MAX31855 SPI MISO | GPIO2 | HSPI default MISO (read-only device, MOSI unused) |
-| MAX31855 SPI CS | GPIO10 | HSPI default CS |
-| Plate NTC ADC input | GPIO0 | ADC1_CH0 |
-| Top heater (SSR) output | GPIO4 | Digital output |
-| Bottom heater (mechanical relay) output | GPIO5 | Digital output |
-| Status LED (optional) | GPIO8 | Onboard LED on most Super Mini boards |
-| Reserved for `ui_local` | GPIO1, GPIO3, GPIO7, GPIO9, GPIO18, GPIO19 | Available for future buttons/LCD |
-
-GPIO0 is a strapping pin; it is safe to use as an analog input but must not be pulled low by
-external circuitry at boot.
+The exact heater/sensor pin mapping for the external MAX31855, plate NTC, and
+relay outputs should be finalized during board bring-up, but those assignments
+must remain isolated from the core control logic.
 
 ### Confirmed Hardware Interfaces
 
@@ -101,11 +98,12 @@ The following hardware decisions are confirmed and replace the corresponding ent
 
 **Local UI / auxiliary inputs**
 
-- No LCD/local display is planned at this time; `ui_local` remains unimplemented and the GPIOs
-  reserved for it are simply unused for now.
-- Buzzer, fan, door/cover switch, and emergency-stop input are explicitly deferred to a later
-  hardware revision. The safety model and GPIO map should leave room for them, but no firmware
-  work is being done for these in this milestone.
+- The local UI is now a first-class control surface: the Wio Terminal screen and
+  buttons should be usable without any browser or network dependency.
+- The speaker should provide concise, non-blocking audible cues for selection,
+  phase transitions, completion, and faults.
+- Fan, door/cover switch, and emergency-stop input remain deferred to a later
+  hardware revision.
 
 
 ## Hardware Abstraction
@@ -119,10 +117,11 @@ Firmware should isolate hardware-specific code behind small drivers/modules:
 | `relay_output` | Drive mechanical relay outputs using slow time-proportional control |
 | `heater_control` | Own PID/state logic for top and bottom heaters |
 | `profile_engine` | Track current reflow profile phase, target temperature, and ramp/soak timing |
+| `profile_catalog` | Parse the constrained YAML profile catalog loaded from microSD |
 | `safety` | Enforce sensor faults, over-temperature limits, watchdogs, and emergency shutdown |
 | `config_store` | Persist profiles, calibration values, and configurable limits |
 | `web_api` | Expose status, profile selection, configuration, and logs through lightweight endpoints |
-| `ui_local` | Optional LCD/buttons integration, currently TBD |
+| `ui_local` | Button-driven local run control plus a view model for the Wio Terminal screen/speaker |
 
 ## FreeRTOS Task Model
 
@@ -134,7 +133,7 @@ The control path should have higher priority than networking and UI tasks.
 | Profile task | Medium-high | 100–500 ms | Advance reflow state machine and compute process targets |
 | Telemetry/logging task | Medium | 500 ms–1 s | Record samples, expose recent history, prepare status snapshots |
 | Web/API task | Low | Event-driven | Serve status/config/profile endpoints with minimal processing |
-| Optional UI task | Low-medium | 50–200 ms | Read buttons, update display, avoid blocking control |
+| Optional UI task | Low-medium | 50–200 ms | Read Wio buttons, update display state, and queue speaker notifications without blocking control |
 
 The implementation can combine some of these initially, but the architecture should preserve the same separation of concerns.
 
@@ -186,7 +185,9 @@ A profile phase should eventually support fields such as:
 }
 ```
 
-Initial firmware can start with one built-in profile, but the data model should allow loading custom profiles from persistent storage later.
+The firmware keeps a built-in fallback profile for bring-up, but the primary
+user-facing path should load one or more profiles from a constrained YAML
+catalog on the Wio Terminal's microSD card.
 
 ## Safety Model
 
@@ -219,11 +220,13 @@ Configuration should include at minimum:
 | Active profile | Selected reflow profile |
 | Sensor calibration values | ADC calibration, NTC parameters, thermocouple offsets if required |
 
-ESP-IDF NVS is a reasonable first persistent storage backend.
+ESP-IDF NVS remains acceptable for small device configuration values during the
+transition, but user-editable reflow profiles should live in the microSD YAML
+catalog so they can be updated off-device.
 
 ## Web/API Design
 
-The ESP32-C3 should do as little web rendering as possible.
+The firmware should do as little web rendering as possible.
 
 Preferred approach:
 
@@ -274,7 +277,7 @@ Possible calibration features:
 ## Initial Firmware Milestones
 
 The following milestones are implemented in [`firmware/`](../firmware/) (see its README for
-build instructions); 11 and 12 remain future work.
+build instructions); later board-specific Wio Terminal wiring remains future work.
 
 1. Create ESP-IDF project skeleton. ✅
 2. Implement GPIO relay outputs with forced-safe default-off behavior. ✅
@@ -286,19 +289,22 @@ build instructions); 11 and 12 remain future work.
 8. Implement safety/fault state that disables both heaters. ✅
 9. Add lightweight `/api/status` endpoint. ✅
 10. Add configuration persistence for plate limit and safety thresholds. ✅
-11. Add editable/custom profile support.
-12. Add calibration/tuning routines.
+11. Add host-testable YAML profile catalog parsing for microSD-backed profiles. ✅
+12. Add host-testable local Wio Terminal button-control / display-notification state. ✅
+13. Wire the Wio Terminal LCD, buttons, speaker, and SD card into the board-specific runtime.
+14. Add calibration/tuning routines.
 
 ## Testability & Host-Side Unit Testing
 
 To keep the safety-critical logic verifiable without hardware or the ESP-IDF toolchain, the
 firmware separates **hardware-independent core logic** from **ESP-IDF hardware adapters**:
 
-- The `core` component (profile engine state machine, safety fault evaluation, NTC
-  temperature conversion math, relay time-proportional window calculation, and heater
+- The `core` component (profile engine state machine, YAML profile catalog parser,
+  local button-control/view-state logic, safety fault evaluation, NTC temperature
+  conversion math, relay time-proportional window calculation, and heater
   bang-bang/PID control) contains no ESP-IDF, FreeRTOS, or hardware I/O calls. It only depends
   on the C standard library, so it can be compiled and unit tested with a plain host
-  toolchain (e.g. gcc + CMake/CTest) independent of ESP-IDF.
+  toolchain independent of ESP-IDF and reusable in a Wio Terminal port.
 - ESP-IDF specific components (`thermocouple_max31855`, `plate_ntc`, `relay_output`,
   `config_store`, `web_api`) are thin adapters that perform hardware I/O and call into `core`
   for all decision logic.
@@ -307,11 +313,12 @@ firmware separates **hardware-independent core logic** from **ESP-IDF hardware a
 
 ## Open Firmware Decisions
 
-- Exact ESP-IDF version.
+- Exact Wio Terminal board support package / runtime strategy for the board-specific app.
+- External heater/sensor pin allocation for the Wio Terminal wiring harness.
+- Exact ESP-IDF version for the temporary reference runtime.
 - Whether to use PID immediately or begin with bang-bang/time-proportional control and evolve to PID.
 - Initial default values for safety limits and PID constants.
-- JSON schema for custom profiles.
+- Whether the constrained YAML profile schema should grow beyond the current phase-based fields.
 - How much telemetry history to retain in RAM versus persistent logs.
 - Whether to add mDNS/captive portal behavior for first-time Wi-Fi setup.
-- Buzzer, fan, door/cover switch, and emergency-stop input: deferred to a later hardware revision.
-- Local LCD/display: not planned at this time (see "Confirmed Hardware Interfaces").
+- Fan, door/cover switch, and emergency-stop input: deferred to a later hardware revision.
