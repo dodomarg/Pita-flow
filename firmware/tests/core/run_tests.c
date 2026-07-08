@@ -12,6 +12,7 @@
 #include "core/profile_engine.h"
 #include "core/relay_timing.h"
 #include "core/safety.h"
+#include "core/thermal_runaway.h"
 #include "core/ui_local.h"
 
 static int g_failures = 0;
@@ -245,8 +246,76 @@ static void test_safety(void)
     invalid_profile.active_profile_valid = 0;
     CHECK((safety_evaluate(&invalid_profile, &limits) & SAFETY_FAULT_INVALID_PROFILE) != 0);
 
+    safety_inputs_t runaway = ok_inputs;
+    runaway.thermal_runaway = 1;
+    CHECK((safety_evaluate(&runaway, &limits) & SAFETY_FAULT_THERMAL_RUNAWAY) != 0);
+
     CHECK(safety_evaluate(NULL, &limits) != SAFETY_FAULT_NONE);
     CHECK(safety_evaluate(&ok_inputs, NULL) != SAFETY_FAULT_NONE);
+}
+
+static void test_thermal_runaway(void)
+{
+    const thermal_runaway_config_t cfg = {.min_rise_c = 2.0f, .window_ms = 1000};
+    thermal_runaway_monitor_t m;
+    thermal_runaway_reset(&m);
+
+    /* Heater off: never trips regardless of how long temperature is flat. */
+    for (int i = 0; i < 20; i++) {
+        CHECK(thermal_runaway_update(&m, &cfg, 0, 25.0f, 100) == 0);
+    }
+
+    /* Heating but temperature stuck flat: trips once the window elapses. */
+    thermal_runaway_reset(&m);
+    int tripped = 0;
+    for (int i = 0; i < 20; i++) {
+        if (thermal_runaway_update(&m, &cfg, 1, 25.0f, 100)) {
+            tripped = 1;
+            break;
+        }
+    }
+    CHECK(tripped == 1);
+
+    /* Heating and climbing fast enough: never trips over a long run. */
+    thermal_runaway_reset(&m);
+    float t = 25.0f;
+    int climbed_ok = 1;
+    for (int i = 0; i < 100; i++) {
+        t += 0.5f; /* 5 C/s at 100 ms ticks -> easily beats 2 C / 1 s */
+        if (thermal_runaway_update(&m, &cfg, 1, t, 100)) {
+            climbed_ok = 0;
+            break;
+        }
+    }
+    CHECK(climbed_ok == 1);
+
+    /* Falling temperature while heating trips as well. */
+    thermal_runaway_reset(&m);
+    float falling = 200.0f;
+    int fall_tripped = 0;
+    for (int i = 0; i < 20; i++) {
+        falling -= 1.0f;
+        if (thermal_runaway_update(&m, &cfg, 1, falling, 100)) {
+            fall_tripped = 1;
+            break;
+        }
+    }
+    CHECK(fall_tripped == 1);
+
+    /* A disabled window (window_ms == 0) never trips. */
+    const thermal_runaway_config_t disabled = {.min_rise_c = 2.0f, .window_ms = 0};
+    thermal_runaway_reset(&m);
+    int disabled_tripped = 0;
+    for (int i = 0; i < 50; i++) {
+        if (thermal_runaway_update(&m, &disabled, 1, 25.0f, 100)) {
+            disabled_tripped = 1;
+            break;
+        }
+    }
+    CHECK(disabled_tripped == 0);
+
+    CHECK(thermal_runaway_update(NULL, &cfg, 1, 25.0f, 100) == 0);
+    CHECK(thermal_runaway_update(&m, NULL, 1, 25.0f, 100) == 0);
 }
 
 static void test_profile_catalog_yaml(void)
@@ -406,6 +475,7 @@ int main(void)
     test_heater_control_pid_clamps();
     test_profile_engine();
     test_safety();
+    test_thermal_runaway();
     test_profile_catalog_yaml();
     test_ui_local_controller();
 

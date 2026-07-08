@@ -1,0 +1,38 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "PlatformIO: Build (Wio Terminal)",
+            "type": "shell",
+            "command": "pio run",
+            "options": {
+                "cwd": "${workspaceFolder}/firmware/wio_terminal"
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "PlatformIO: Upload (Wio Terminal)",
+            "type": "shell",
+            "command": "pio run -t upload",
+            "options": {
+                "cwd": "${workspaceFolder}/firmware/wio_terminal"
+            },
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "Core: Run host unit tests",
+            "type": "shell",
+            "command": "bash firmware/tests/core/run_tests.sh",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": "test",
+            "problemMatcher": []
+        }
+    ]
+}

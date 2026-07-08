@@ -16,48 +16,42 @@ safety model, and roadmap.
 
 ```
 firmware/
-  main/                 App entry point, Wi-Fi bring-up, built-in profile, task wiring
   components/
     core/               Hardware-independent logic: profile engine, safety
                          evaluation, NTC math, relay timing, heater control,
                          YAML profile catalog parsing, and local UI state/control.
-                         No ESP-IDF/FreeRTOS dependency - buildable/testable
+                         No hardware/RTOS dependency - buildable/testable
                          with a plain host C toolchain.
-    drivers/             ESP-IDF hardware adapters: MAX31855 thermocouple (SPI),
-                         plate NTC (ADC), relay outputs (GPIO). Thin wrappers
-                         around `core`.
-    config_store/        NVS-backed persistent configuration.
-    web_api/             esp_http_server based `/api/*` endpoints.
   profiles/             Example microSD YAML profile catalog for Wio Terminal.
   tests/core/            Host-buildable unit tests for the `core` component.
+  wio_terminal/         PlatformIO project for the Wio Terminal board
+                        (Arduino framework): reuses `components/core`
+                        unmodified and adds Arduino-based drivers for the
+                        screen, buttons, speaker, microSD, external
+                        MAX31855, plate NTC, and heater relays.
 ```
 
 ## Board-specific runtime status
 
-The heater/sensor runtime in `main/`, `drivers/`, `config_store/`, and
-`web_api/` is still the earlier ESP-IDF reference implementation. The Wio
-Terminal adaptation in this change set focuses on hardware-independent pieces
-that can be shared by the eventual board bring-up: local button control, screen
-view state, and YAML profile catalog parsing.
+The Wio Terminal board port in `wio_terminal/` is the single supported
+runtime: it wires the shared `core` control/safety logic to real screen/
+button/speaker/microSD/relay/sensor drivers on the Wio Terminal's SAMD51 MCU.
+Hardware pin assignments there are bring-up placeholders pending the external
+sensor/relay board finalization described in docs/firmware-plan.md.
 
-## Building the current reference runtime (requires ESP-IDF)
+## Building the Wio Terminal firmware (PlatformIO)
 
-The current reference runtime still requires the
-[ESP-IDF](https://github.com/espressif/esp-idf) SDK and toolchain, which are
-not part of this repository. Once ESP-IDF is installed and sourced
-(`. $IDF_PATH/export.sh`):
+The Wio Terminal board port requires [PlatformIO](https://platformio.org/):
 
 ```sh
-cd firmware
-idf.py set-target esp32c3
-idf.py menuconfig   # set Pita-flow Configuration -> Wi-Fi SSID/Password
-idf.py build
-idf.py -p <PORT> flash monitor
+cd firmware/wio_terminal
+pio run                     # build
+pio run -t upload           # flash over USB
 ```
 
-## Running the core unit tests (no ESP-IDF required)
+## Running the core unit tests
 
-The `core` component has no hardware or ESP-IDF dependency, so its logic can
+The `core` component has no hardware or RTOS dependency, so its logic can
 be exercised with a plain C toolchain:
 
 ```sh

@@ -1,0 +1,8 @@
+# PlatformIO build output
+.pio/
+
+# Editor/OS cruft
+.DS_Store
+
+# Host unit-test binary
+/tmp/pita_flow_core_tests

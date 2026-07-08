@@ -35,6 +35,9 @@ uint32_t safety_evaluate(const safety_inputs_t *inputs, const safety_limits_t *l
     if (!inputs->active_profile_valid) {
         faults |= SAFETY_FAULT_INVALID_PROFILE;
     }
+    if (inputs->thermal_runaway) {
+        faults |= SAFETY_FAULT_THERMAL_RUNAWAY;
+    }
 
     return faults;
 }

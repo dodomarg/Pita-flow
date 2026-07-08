@@ -17,6 +17,7 @@ typedef enum {
     SAFETY_FAULT_CONTROL_WATCHDOG_TIMEOUT = 1 << 5,
     SAFETY_FAULT_RELAY_COMMANDED_WHILE_IDLE = 1 << 6,
     SAFETY_FAULT_INVALID_PROFILE = 1 << 7,
+    SAFETY_FAULT_THERMAL_RUNAWAY = 1 << 8,
 } safety_fault_flags_t;
 
 typedef struct {
@@ -44,6 +45,11 @@ typedef struct {
 
     /* Profile validity. */
     int active_profile_valid;
+
+    /* Open-loop / thermal-runaway guard result (heater energized but the
+     * temperature is not climbing as expected). Computed statefully by the
+     * caller via the thermal_runaway module. */
+    int thermal_runaway;
 } safety_inputs_t;
 
 /**
