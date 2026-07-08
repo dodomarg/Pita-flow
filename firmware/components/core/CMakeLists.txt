@@ -4,7 +4,9 @@ idf_component_register(
         "src/relay_timing.c"
         "src/heater_control.c"
         "src/profile_engine.c"
+        "src/profile_catalog.c"
         "src/safety.c"
+        "src/ui_local.c"
     INCLUDE_DIRS
         "include"
 )

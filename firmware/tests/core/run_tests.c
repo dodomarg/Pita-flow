@@ -8,9 +8,11 @@
 
 #include "core/heater_control.h"
 #include "core/ntc_convert.h"
+#include "core/profile_catalog.h"
 #include "core/profile_engine.h"
 #include "core/relay_timing.h"
 #include "core/safety.h"
+#include "core/ui_local.h"
 
 static int g_failures = 0;
 static int g_checks = 0;
@@ -247,6 +249,155 @@ static void test_safety(void)
     CHECK(safety_evaluate(&ok_inputs, NULL) != SAFETY_FAULT_NONE);
 }
 
+static void test_profile_catalog_yaml(void)
+{
+    const char *yaml =
+        "profiles:\n"
+        "  - name: leaded\n"
+        "    phases:\n"
+        "      - name: preheat\n"
+        "        duration_s: 60\n"
+        "        target_chamber_c: 150\n"
+        "        ramp_rate_c_per_s: 1.5\n"
+        "        bottom_heater_mode: limited\n"
+        "        bottom_plate_limit_c: 150\n"
+        "        top_heater_enabled: true\n"
+        "      - name: reflow\n"
+        "        duration_s: 45\n"
+        "        target_chamber_c: 220\n"
+        "        ramp_rate_c_per_s: 1.0\n"
+        "        bottom_heater_mode: off\n"
+        "        bottom_plate_limit_c: 0\n"
+        "        top_heater_enabled: true\n"
+        "  - name: low-temp\n"
+        "    phases:\n"
+        "      - name: warmup\n"
+        "        duration_s: 50\n"
+        "        target_chamber_c: 120\n"
+        "        ramp_rate_c_per_s: 1.2\n"
+        "        bottom_heater_mode: enabled\n"
+        "        bottom_plate_limit_c: 130\n"
+        "        top_heater_enabled: true\n"
+        "      - name: cooldown\n"
+        "        duration_s: 40\n"
+        "        target_chamber_c: 40\n"
+        "        ramp_rate_c_per_s: 2.0\n"
+        "        bottom_heater_mode: off\n"
+        "        bottom_plate_limit_c: 0\n"
+        "        top_heater_enabled: false\n";
+
+    reflow_profile_catalog_t catalog;
+    CHECK(profile_catalog_parse_yaml(yaml, &catalog) == 0);
+    CHECK(catalog.profile_count == 2);
+
+    const reflow_profile_t *profile0 = profile_catalog_get(&catalog, 0);
+    const reflow_profile_t *profile1 = profile_catalog_get(&catalog, 1);
+    CHECK(profile0 != NULL);
+    CHECK(profile1 != NULL);
+    CHECK(strcmp(profile0->name, "leaded") == 0);
+    CHECK(profile0->phase_count == 2);
+    CHECK(strcmp(profile0->phases[0].name, "preheat") == 0);
+    CHECK(profile0->phases[0].bottom_heater_mode == BOTTOM_HEATER_MODE_LIMITED);
+    CHECK(profile0->phases[1].bottom_heater_mode == BOTTOM_HEATER_MODE_OFF);
+    CHECK(strcmp(profile1->name, "low-temp") == 0);
+    CHECK(profile1->phases[1].top_heater_enabled == 0);
+    CHECK(profile_catalog_get(&catalog, 99) == NULL);
+
+    const char *invalid_yaml =
+        "profiles:\n"
+        "  - name: broken\n"
+        "    phases:\n"
+        "      - name: preheat\n"
+        "        duration_s: 60\n"
+        "        target_chamber_c: 150\n"
+        "        ramp_rate_c_per_s: 1.5\n"
+        "        bottom_heater_mode: invalid-mode\n"
+        "        bottom_plate_limit_c: 150\n"
+        "        top_heater_enabled: true\n";
+    CHECK(profile_catalog_parse_yaml(invalid_yaml, &catalog) != 0);
+}
+
+static void test_ui_local_controller(void)
+{
+    reflow_profile_t profiles[2];
+    memset(profiles, 0, sizeof(profiles));
+
+    strncpy(profiles[0].name, "profile-a", sizeof(profiles[0].name) - 1);
+    profiles[0].phase_count = 2;
+    strncpy(profiles[0].phases[0].name, "preheat", sizeof(profiles[0].phases[0].name) - 1);
+    profiles[0].phases[0].duration_s = 2;
+    profiles[0].phases[0].target_chamber_c = 150.0f;
+    profiles[0].phases[0].ramp_rate_c_per_s = 0.0f;
+    profiles[0].phases[0].bottom_heater_mode = BOTTOM_HEATER_MODE_LIMITED;
+    profiles[0].phases[0].bottom_plate_limit_c = 150.0f;
+    profiles[0].phases[0].top_heater_enabled = 1;
+    strncpy(profiles[0].phases[1].name, "reflow", sizeof(profiles[0].phases[1].name) - 1);
+    profiles[0].phases[1].duration_s = 2;
+    profiles[0].phases[1].target_chamber_c = 220.0f;
+    profiles[0].phases[1].ramp_rate_c_per_s = 1.0f;
+    profiles[0].phases[1].bottom_heater_mode = BOTTOM_HEATER_MODE_OFF;
+    profiles[0].phases[1].bottom_plate_limit_c = 0.0f;
+    profiles[0].phases[1].top_heater_enabled = 1;
+
+    strncpy(profiles[1].name, "profile-b", sizeof(profiles[1].name) - 1);
+    profiles[1].phase_count = 1;
+    strncpy(profiles[1].phases[0].name, "short", sizeof(profiles[1].phases[0].name) - 1);
+    profiles[1].phases[0].duration_s = 3;
+    profiles[1].phases[0].target_chamber_c = 180.0f;
+    profiles[1].phases[0].ramp_rate_c_per_s = 0.0f;
+    profiles[1].phases[0].bottom_heater_mode = BOTTOM_HEATER_MODE_ENABLED;
+    profiles[1].phases[0].bottom_plate_limit_c = 140.0f;
+    profiles[1].phases[0].top_heater_enabled = 1;
+
+    profile_engine_t engine;
+    memset(&engine, 0, sizeof(engine));
+
+    ui_local_controller_t controller;
+    ui_local_controller_init(&controller, 2, 0);
+    CHECK(controller.selected_profile_index == 0);
+
+    ui_local_status_t status;
+    ui_local_controller_snapshot(&controller, &engine, profiles, &status);
+    CHECK(strcmp(status.selected_profile_name, "profile-a") == 0);
+    CHECK(status.can_select_next == 1);
+
+    CHECK(ui_local_controller_handle_button(&controller, UI_LOCAL_BUTTON_NEXT, &engine, profiles) ==
+          UI_LOCAL_NOTIFICATION_PROFILE_CHANGED);
+    CHECK(controller.selected_profile_index == 1);
+
+    CHECK(ui_local_controller_handle_button(&controller, UI_LOCAL_BUTTON_SELECT, &engine, profiles) ==
+          UI_LOCAL_NOTIFICATION_RUN_STARTED);
+    CHECK(engine.state == PROFILE_ENGINE_STATE_RUNNING);
+    CHECK(controller.active_profile_index == 1);
+
+    CHECK(ui_local_controller_handle_button(&controller, UI_LOCAL_BUTTON_NEXT, &engine, profiles) ==
+          UI_LOCAL_NOTIFICATION_NONE);
+    CHECK(controller.selected_profile_index == 1);
+
+    CHECK(ui_local_controller_observe_engine(&controller, &engine, 0) == UI_LOCAL_NOTIFICATION_NONE);
+    profile_engine_tick(&engine, 1.0f);
+    CHECK(ui_local_controller_observe_engine(&controller, &engine, 0) == UI_LOCAL_NOTIFICATION_NONE);
+
+    CHECK(ui_local_controller_handle_button(&controller, UI_LOCAL_BUTTON_SELECT, &engine, profiles) ==
+          UI_LOCAL_NOTIFICATION_RUN_STOPPED);
+    CHECK(engine.state == PROFILE_ENGINE_STATE_IDLE);
+
+    CHECK(ui_local_controller_handle_button(&controller, UI_LOCAL_BUTTON_PREVIOUS, &engine, profiles) ==
+          UI_LOCAL_NOTIFICATION_PROFILE_CHANGED);
+    CHECK(controller.selected_profile_index == 0);
+
+    CHECK(ui_local_controller_handle_button(&controller, UI_LOCAL_BUTTON_SELECT, &engine, profiles) ==
+          UI_LOCAL_NOTIFICATION_RUN_STARTED);
+    profile_engine_tick(&engine, 2.0f);
+    CHECK(ui_local_controller_observe_engine(&controller, &engine, 0) == UI_LOCAL_NOTIFICATION_PHASE_CHANGED);
+    profile_engine_tick(&engine, 2.0f);
+    CHECK(ui_local_controller_observe_engine(&controller, &engine, 0) == UI_LOCAL_NOTIFICATION_COMPLETE);
+
+    profile_engine_force_fault(&engine);
+    CHECK(ui_local_controller_observe_engine(&controller, &engine, SAFETY_FAULT_INVALID_PROFILE) ==
+          UI_LOCAL_NOTIFICATION_FAULT);
+}
+
 int main(void)
 {
     test_ntc_convert();
@@ -255,6 +406,8 @@ int main(void)
     test_heater_control_pid_clamps();
     test_profile_engine();
     test_safety();
+    test_profile_catalog_yaml();
+    test_ui_local_controller();
 
     printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

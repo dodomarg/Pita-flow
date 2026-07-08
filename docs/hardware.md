@@ -1,8 +1,11 @@
 # Hardware Specification
 
-Pita-flow is an ESP32-C3 based controller for a converted flat-bread maker / reflow oven.
+Pita-flow is being adapted around a Wio Terminal local operator console for a
+converted flat-bread maker / reflow oven.
 
-The design goal is stable, repeatable PCB reflow temperature control while keeping firmware timing deterministic and the web/UI layer lightweight.
+The design goal is stable, repeatable PCB reflow temperature control while
+keeping firmware timing deterministic and the local UI lightweight and
+responsive.
 
 ## System Overview
 
@@ -13,21 +16,45 @@ The oven has two independently controlled mains-voltage heaters:
 | Bottom plate heater | Embedded heater under the plate | 800 W | 240 VAC / mains | Mechanical relay | Preheat and soak assist; limited by configurable plate-temperature ceiling |
 | Top chamber heater | Radiative quartz heater in chamber | 1000 W | Mains | Solid-state relay (SSR) | Primary reflow heater, especially during solder reflow/liquidus phase |
 
-The bottom plate heater is switched using a **mechanical relay**, while the top quartz heater is switched using a **solid-state relay (SSR)**. Both channels use **slow time-proportional PWM** with a nominal **1 second control window** for consistency, even though the SSR is capable of much faster switching; this keeps the bottom heater's mechanical relay within a reasonable switching-cycle lifetime and keeps the control scheme identical for both channels.
+The bottom plate heater is switched using a **mechanical relay**, while the top
+quartz heater is switched using a **solid-state relay (SSR)**. Both channels
+use **slow time-proportional PWM** with a nominal **1 second control window**
+for consistency, even though the SSR is capable of much faster switching; this
+keeps the bottom heater's mechanical relay within a reasonable
+switching-cycle lifetime and keeps the control scheme identical for both
+channels.
 
-> Safety note: this project controls mains-voltage heaters. Relay and SSR drive, isolation, fusing, grounding, enclosure, wiring clearances, strain relief, SSR heatsinking, and emergency shutdown must be designed and reviewed appropriately before hardware is energized.
+> Safety note: this project controls mains-voltage heaters. Relay and SSR
+> drive, isolation, fusing, grounding, enclosure, wiring clearances, strain
+> relief, SSR heatsinking, and emergency shutdown must be designed and reviewed
+> appropriately before hardware is energized.
+
+## Wio Terminal Operator Console
+
+The Wio Terminal contributes the local operator interface:
+
+| Built-in feature | Planned role |
+|---|---|
+| IPS LCD | Show selected profile, active phase, temperatures, heater outputs, and faults |
+| Three front buttons | Previous profile, start/stop/acknowledge, next profile |
+| microSD slot | Store the `reflow-profiles.yaml` catalog |
+| Speaker | Audible feedback for selection changes, phase transitions, completion, and fault alarms |
+
+These built-in resources reduce external wiring and make the oven operable
+without a browser or separate control panel.
 
 ## Sensors and Safety Devices
 
 | Sensor / safety device | Location | Interface | Purpose |
 |---|---|---|---|
-| 100K NTC thermistor | Embedded in bottom plate | ESP32-C3 ADC input via voltage divider | Measures plate temperature; used to limit and control bottom heater |
+| 100K NTC thermistor | Embedded in bottom plate | Wio Terminal analog input via voltage divider | Measures plate temperature; used to limit and control bottom heater |
 | K-type thermocouple | Suspended above plate in oven chamber | MAX31855 thermocouple interface over SPI | Measures chamber/process temperature; primary profile-control sensor |
 | 250 °C thermal cutoff switch | Bottom plate | Hardware safety cutoff | Independent plate over-temperature protection |
 
 ## Thermal Control Philosophy
 
-The two heaters have different functions and should not be treated as identical heat sources.
+The two heaters have different functions and should not be treated as identical
+heat sources.
 
 | Reflow phase | Bottom plate heater | Top quartz heater | Notes |
 |---|---|---|---|
@@ -38,29 +65,29 @@ The two heaters have different functions and should not be treated as identical 
 | Cooldown | Off | Off | Cooling is passive unless future hardware adds fan/vent control |
 | Fault | Off | Off | Any critical fault disables both relays |
 
-The bottom plate temperature ceiling is a **firmware-configurable parameter**. It is intentionally not hardcoded in the hardware design, because it will need tuning based on board material, oven behavior, profile type, and measured temperature gradients.
+The bottom plate temperature ceiling is a **firmware-configurable parameter**.
+It is intentionally not hardcoded in the hardware design, because it will need
+tuning based on board material, oven behavior, profile type, and measured
+temperature gradients.
 
-## Proposed ESP32-C3 Pinout
+## External Wiring Summary
 
-The current pinout avoids using boot-sensitive strapping pins for heater relay outputs and reserves the native USB pins for programming/debugging.
+The Wio Terminal already provides the screen, buttons, microSD slot, and
+speaker, so the external harness only needs to cover the oven I/O:
 
-| Signal | ESP32-C3 GPIO | Direction | Notes |
-|---|---:|---|---|
-| MAX31855 SCK | GPIO4 | Output | SPI clock for thermocouple interface |
-| MAX31855 MISO / SO | GPIO5 | Input | MAX31855 is read-only; no MOSI required |
-| MAX31855 CS | GPIO6 | Output | Thermocouple chip select |
-| Plate NTC ADC | GPIO0 / ADC1_CH0 | Input | Voltage divider input for 100K NTC |
-| Bottom heater relay drive | GPIO7 | Output | Time-proportional mechanical relay control; must default safe/off |
-| Top heater SSR drive | GPIO10 | Output | Time-proportional SSR control; must default safe/off |
-| Optional I2C SDA | GPIO8 | I/O | Reserved for possible LCD/UI; strapping pin, use carefully |
-| Optional I2C SCL | GPIO9 | I/O | Reserved for possible LCD/UI; strapping pin, use carefully |
-| Optional button 1 | GPIO1 | Input | Future local UI input, preferably interrupt-capable |
-| Optional button 2 | GPIO3 | Input | Future local UI input, preferably interrupt-capable |
-| USB D- / D+ | GPIO18 / GPIO19 | Reserved | Native USB serial/JTAG/programming |
+| Signal | Direction | Notes |
+|---|---|---|
+| MAX31855 SCK / MISO / CS | MCU ↔ sensor | Use the Wio Terminal hardware SPI bus with a dedicated CS line |
+| Plate NTC ADC | Input | Route the divider node to a Wio Terminal analog-capable input |
+| Bottom heater relay drive | Output | Time-proportional mechanical relay control; must default safe/off |
+| Top heater SSR drive | Output | Time-proportional SSR control; must default safe/off |
+| Thermal cutoff chain | Hardware interlock | Remains in series with the bottom heater regardless of firmware state |
 
 ### Bottom Heater Relay Drive Requirements (Mechanical Relay)
 
-The ESP32-C3 GPIO7 output must not drive the relay coil directly. The bottom heater relay channel should include, as appropriate for the selected relay module or discrete circuit:
+The selected Wio Terminal GPIO must not drive the relay coil directly. The
+bottom heater relay channel should include, as appropriate for the selected
+relay module or discrete circuit:
 
 - transistor or MOSFET driver stage,
 - flyback diode for DC relay coils,
@@ -70,32 +97,40 @@ The ESP32-C3 GPIO7 output must not drive the relay coil directly. The bottom hea
 
 ### Top Heater SSR Drive Requirements (Solid-State Relay)
 
-The ESP32-C3 GPIO10 output drives the top quartz heater through a solid-state relay (SSR) rather than a mechanical relay. Requirements differ from the mechanical relay channel:
+The selected Wio Terminal GPIO drives the top quartz heater through a
+solid-state relay (SSR) rather than a mechanical relay. Requirements differ
+from the mechanical relay channel:
 
-- series current-limiting resistor sized for the SSR's input LED, unless the selected SSR module already includes its own input conditioning circuitry,
-- prefer a zero-cross switching SSR to reduce electrical noise and inrush current, unless phase-angle control is intentionally required,
-- opto-isolation is inherent to the SSR itself, but low-voltage control wiring and mains-side output terminals must still be kept physically separated with adequate creepage/clearance,
-- adequate heatsinking for the SSR output stage, sized for the 1000 W load and expected duty cycle, since SSRs dissipate heat across their output junction unlike mechanical relay contacts,
-- snubber circuit (RC or MOV) across the SSR output if required by the manufacturer, particularly for inductive or high inrush loads,
-- defined default-off behavior during reset/boot (control line must not float high while the ESP32-C3 is booting/resetting),
-- confirm SSR current/voltage rating includes an appropriate safety margin above the 1000 W steady-state load current.
+- series current-limiting resistor sized for the SSR's input LED, unless the
+  selected SSR module already includes its own input conditioning circuitry,
+- prefer a zero-cross switching SSR to reduce electrical noise and inrush
+  current, unless phase-angle control is intentionally required,
+- opto-isolation is inherent to the SSR itself, but low-voltage control wiring
+  and mains-side output terminals must still be kept physically separated with
+  adequate creepage/clearance,
+- adequate heatsinking for the SSR output stage, sized for the 1000 W load and
+  expected duty cycle, since SSRs dissipate heat across their output junction
+  unlike mechanical relay contacts,
+- snubber circuit (RC or MOV) across the SSR output if required by the
+  manufacturer, particularly for inductive or high inrush loads,
+- defined default-off behavior during reset/boot (control line must not float
+  high while the MCU is booting/resetting),
+- confirm SSR current/voltage rating includes an appropriate safety margin above
+  the 1000 W steady-state load current.
 
 ## Connection Diagram
 
 ```mermaid
 flowchart LR
-    subgraph MCU[ESP32-C3]
-        GPIO0[GPIO0 / ADC1_CH0\nPlate NTC ADC]
-        GPIO4[GPIO4\nSPI SCK]
-        GPIO5[GPIO5\nSPI MISO]
-        GPIO6[GPIO6\nSPI CS]
-        GPIO7[GPIO7\nBottom relay drive]
-        GPIO10[GPIO10\nTop SSR drive]
-        GPIO8[GPIO8\nOptional I2C SDA]
-        GPIO9[GPIO9\nOptional I2C SCL]
-        GPIO1[GPIO1\nOptional button]
-        GPIO3[GPIO3\nOptional button]
-        USB[GPIO18/19\nUSB serial/JTAG]
+    subgraph MCU[Wio Terminal]
+        LCD[Built-in LCD]
+        BTN[Built-in buttons]
+        SD[Built-in microSD]
+        SPK[Built-in speaker]
+        ADC[Analog input\nPlate NTC ADC]
+        SPI[SPI bus\nMAX31855]
+        BRGPIO[Relay drive GPIO]
+        SSRGPIO[SSR drive GPIO]
     end
 
     subgraph Sensors[Sensors]
@@ -114,32 +149,23 @@ flowchart LR
         CUTOFF[250 °C thermal cutoff\nplate safety]
     end
 
-    subgraph OptionalUI[Optional local UI]
-        LCD[I2C LCD / display TBD]
-        B1[Button 1 TBD]
-        B2[Button 2 TBD]
-    end
-
-    NTC --> GPIO0
-    GPIO4 --> MAX
-    MAX --> GPIO5
-    GPIO6 --> MAX
+    NTC --> ADC
+    SPI --> MAX
     TC --> MAX
 
-    GPIO7 --> BRD --> BR --> CUTOFF --> BH
-    GPIO10 --> TRD --> TR --> TH
-
-    GPIO8 --> LCD
-    GPIO9 --> LCD
-    GPIO1 --> B1
-    GPIO3 --> B2
+    BRGPIO --> BRD --> BR --> CUTOFF --> BH
+    SSRGPIO --> TRD --> TR --> TH
 ```
 
 ## Open Hardware Decisions
 
-- Confirm exact ESP32-C3 module/dev board variant and available pins.
-- Confirm bottom heater mechanical relay module electrical interface and whether inputs are active-high or active-low.
-- Confirm top heater SSR part number, control input range/current, zero-cross vs random-fire switching, and heatsink requirements.
-- Define NTC divider resistor value, ADC attenuation, filtering, and calibration method.
-- Confirm LCD/display type if local UI is added.
-- Decide whether to add a buzzer, fan, door/cover switch, or emergency-stop input in a later revision.
+- Finalize the exact Wio Terminal external pin assignments for SPI chip-select,
+  analog NTC input, and the two heater outputs.
+- Confirm bottom heater mechanical relay module electrical interface and whether
+  inputs are active-high or active-low.
+- Confirm top heater SSR part number, control input range/current, zero-cross vs
+  random-fire switching, and heatsink requirements.
+- Define NTC divider resistor value, ADC attenuation, filtering, and
+  calibration method.
+- Decide whether to add a fan, door/cover switch, or emergency-stop input in a
+  later revision.
