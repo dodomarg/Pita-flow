@@ -31,6 +31,7 @@ extern "C" {
 #include "core/built_in_profile.h"
 #include "core/heater_control.h"
 #include "core/ntc_convert.h"
+#include "core/pid_autotune.h"
 #include "core/profile_catalog.h"
 #include "core/profile_engine.h"
 #include "core/relay_timing.h"
@@ -73,6 +74,13 @@ typedef struct {
     uint32_t control_watchdog_timeout_ms;
     float runaway_min_rise_c;
     uint32_t runaway_window_ms;
+    /* Per-channel PID gains (0 kp => that channel runs bang-bang). Populated
+     * by the on-device PID autotune. */
+    float top_kp, top_ki, top_kd;
+    float bottom_kp, bottom_ki, bottom_kd;
+    /* Autotune setpoints per channel. */
+    float cal_top_target_c;
+    float cal_bottom_target_c;
 } app_settings_t;
 
 static app_settings_t s_settings = {
@@ -84,6 +92,14 @@ static app_settings_t s_settings = {
     .control_watchdog_timeout_ms = 2000,
     .runaway_min_rise_c = 2.0f,
     .runaway_window_ms = 30000,
+    .top_kp = 0.0f,
+    .top_ki = 0.0f,
+    .top_kd = 0.0f,
+    .bottom_kp = 0.0f,
+    .bottom_ki = 0.0f,
+    .bottom_kd = 0.0f,
+    .cal_top_target_c = 200.0f,
+    .cal_bottom_target_c = 150.0f,
 };
 
 static const ntc_params_t kPlateNtcParams = {
@@ -664,6 +680,7 @@ typedef enum {
     SCREEN_PROFILE_EDIT,
     SCREEN_NAME_EDIT,
     SCREEN_PINOUT,
+    SCREEN_CALIBRATE,
 } screen_t;
 
 typedef enum {
@@ -687,9 +704,17 @@ static int s_edit_is_new = 0;
 static int s_name_cursor = 0;
 static reflow_profile_t s_edit_profile;
 
+/* PID autotune / calibration state. */
+static int s_cal_active = 0;
+static int s_cal_channel = 0; /* 0 = top heater, 1 = bottom plate */
+static int s_cal_row = 0;     /* selected channel row on the calibrate screen */
+static pid_autotune_t s_autotune;
+static pid_autotune_status_t s_cal_result_status = PID_AUTOTUNE_RUNNING;
+static float s_cal_kp = 0.0f, s_cal_ki = 0.0f, s_cal_kd = 0.0f;
+
 static const char *const kMenuItems[] = {"Run / Stop", "Select Profile", "Edit Profile", "New Profile",
-                                         "Settings",   "Pinout",         "Save to SD"};
-#define MENU_COUNT 7
+                                         "Settings",   "Calibrate PID", "Pinout",       "Save to SD"};
+#define MENU_COUNT 8
 #define SETTINGS_COUNT 8
 
 /* Profile-editor field indices within a phase row block. */
@@ -783,6 +808,22 @@ static void save_settings_to_sd(void)
     f.println(line);
     snprintf(line, sizeof(line), "runaway_win_ms=%lu", (unsigned long)s_settings.runaway_window_ms);
     f.println(line);
+    snprintf(line, sizeof(line), "top_kp=%.4f", s_settings.top_kp);
+    f.println(line);
+    snprintf(line, sizeof(line), "top_ki=%.4f", s_settings.top_ki);
+    f.println(line);
+    snprintf(line, sizeof(line), "top_kd=%.4f", s_settings.top_kd);
+    f.println(line);
+    snprintf(line, sizeof(line), "bottom_kp=%.4f", s_settings.bottom_kp);
+    f.println(line);
+    snprintf(line, sizeof(line), "bottom_ki=%.4f", s_settings.bottom_ki);
+    f.println(line);
+    snprintf(line, sizeof(line), "bottom_kd=%.4f", s_settings.bottom_kd);
+    f.println(line);
+    snprintf(line, sizeof(line), "cal_top=%.1f", s_settings.cal_top_target_c);
+    f.println(line);
+    snprintf(line, sizeof(line), "cal_bottom=%.1f", s_settings.cal_bottom_target_c);
+    f.println(line);
     f.close();
 }
 
@@ -821,6 +862,22 @@ static void load_settings_from_sd(void)
             s_settings.runaway_min_rise_c = v;
         else if (strcmp(key, "runaway_win_ms") == 0)
             s_settings.runaway_window_ms = (uint32_t)v;
+        else if (strcmp(key, "top_kp") == 0)
+            s_settings.top_kp = v;
+        else if (strcmp(key, "top_ki") == 0)
+            s_settings.top_ki = v;
+        else if (strcmp(key, "top_kd") == 0)
+            s_settings.top_kd = v;
+        else if (strcmp(key, "bottom_kp") == 0)
+            s_settings.bottom_kp = v;
+        else if (strcmp(key, "bottom_ki") == 0)
+            s_settings.bottom_ki = v;
+        else if (strcmp(key, "bottom_kd") == 0)
+            s_settings.bottom_kd = v;
+        else if (strcmp(key, "cal_top") == 0)
+            s_settings.cal_top_target_c = v;
+        else if (strcmp(key, "cal_bottom") == 0)
+            s_settings.cal_bottom_target_c = v;
     }
 }
 
@@ -832,8 +889,20 @@ static void apply_heater_settings(void)
     heater_control_config_t bot = kBottomHeaterConfig;
     top.hysteresis_c = s_settings.top_hysteresis_c;
     bot.hysteresis_c = s_settings.bottom_hysteresis_c;
-    heater_control_init(&s_top_heater_ctrl, HEATER_CONTROL_MODE_BANG_BANG, &top);
-    heater_control_init(&s_bottom_heater_ctrl, HEATER_CONTROL_MODE_BANG_BANG, &bot);
+    top.kp = s_settings.top_kp;
+    top.ki = s_settings.top_ki;
+    top.kd = s_settings.top_kd;
+    bot.kp = s_settings.bottom_kp;
+    bot.ki = s_settings.bottom_ki;
+    bot.kd = s_settings.bottom_kd;
+    /* Use PID once a channel has been calibrated (non-zero kp); otherwise fall
+     * back to the safe bang-bang controller. */
+    heater_control_mode_t top_mode =
+        (s_settings.top_kp > 0.0f) ? HEATER_CONTROL_MODE_PID : HEATER_CONTROL_MODE_BANG_BANG;
+    heater_control_mode_t bot_mode =
+        (s_settings.bottom_kp > 0.0f) ? HEATER_CONTROL_MODE_PID : HEATER_CONTROL_MODE_BANG_BANG;
+    heater_control_init(&s_top_heater_ctrl, top_mode, &top);
+    heater_control_init(&s_bottom_heater_ctrl, bot_mode, &bot);
 }
 
 /* ---- Shared engine helpers -------------------------------------------- */
@@ -860,10 +929,58 @@ static void sync_idle_engine_profile(void)
 
 static void toggle_run(void)
 {
+    if (s_cal_active) {
+        return; /* ignore run requests while a calibration is in progress */
+    }
     ui_local_notification_t n = ui_local_controller_handle_button(&s_ui_controller, UI_LOCAL_BUTTON_SELECT,
                                                                   &s_profile_engine, s_catalog.profiles);
     if (n != UI_LOCAL_NOTIFICATION_NONE) {
         play_notification_tone(n);
+    }
+}
+
+static void start_autotune(int channel)
+{
+    if (s_profile_engine.state == PROFILE_ENGINE_STATE_RUNNING) {
+        return;
+    }
+    s_cal_channel = channel;
+    pid_autotune_config_t cfg;
+    cfg.target_c = (channel == 0) ? s_settings.cal_top_target_c : s_settings.cal_bottom_target_c;
+    cfg.output_max = 100.0f;
+    cfg.target_cycles = 5;
+    cfg.timeout_ms = 20u * 60u * 1000u; /* 20 minute safety timeout */
+    cfg.max_safe_c = (channel == 0) ? s_settings.chamber_absolute_max_c : s_settings.plate_absolute_max_c;
+    pid_autotune_init(&s_autotune, &cfg);
+    s_cal_active = 1;
+    s_cal_result_status = PID_AUTOTUNE_RUNNING;
+    heater_control_reset(&s_top_heater_ctrl);
+    heater_control_reset(&s_bottom_heater_ctrl);
+    reset_temperature_trace();
+    tone(WIO_BUZZER, 1500, 80);
+}
+
+static void cancel_autotune(void)
+{
+    if (!s_cal_active) {
+        return;
+    }
+    s_cal_active = 0;
+    s_cal_result_status = PID_AUTOTUNE_FAILED;
+    relay_output_force_all_off();
+    heater_control_reset(&s_top_heater_ctrl);
+    heater_control_reset(&s_bottom_heater_ctrl);
+    tone(WIO_BUZZER, 400, 150);
+}
+
+static void adjust_cal_target(int channel, int delta)
+{
+    if (channel == 0) {
+        s_settings.cal_top_target_c =
+            clampf(s_settings.cal_top_target_c + (float)delta, 50.0f, s_settings.chamber_absolute_max_c - 5.0f);
+    } else {
+        s_settings.cal_bottom_target_c =
+            clampf(s_settings.cal_bottom_target_c + (float)delta, 50.0f, s_settings.plate_absolute_max_c - 5.0f);
     }
 }
 
@@ -1081,9 +1198,13 @@ static void ui_menu_event(input_event_t ev)
             s_screen = SCREEN_SETTINGS;
             break;
         case 5:
+            s_cal_row = 0;
+            s_screen = SCREEN_CALIBRATE;
+            break;
+        case 6:
             s_screen = SCREEN_PINOUT;
             break;
-        case 6: {
+        case 7: {
             bool ok = save_catalog_to_sd();
             tone(WIO_BUZZER, ok ? 2000 : 300, ok ? 120 : 300);
             break;
@@ -1295,6 +1416,39 @@ static void ui_pinout_event(input_event_t ev)
     }
 }
 
+static void ui_calibrate_event(input_event_t ev)
+{
+    if (s_cal_active) {
+        if (ev == EV_BACK) {
+            cancel_autotune();
+        }
+        return;
+    }
+    switch (ev) {
+    case EV_UP:
+        s_cal_row = (s_cal_row - 1 + 2) % 2;
+        break;
+    case EV_DOWN:
+        s_cal_row = (s_cal_row + 1) % 2;
+        break;
+    case EV_LEFT:
+        adjust_cal_target(s_cal_row, -5);
+        break;
+    case EV_RIGHT:
+        adjust_cal_target(s_cal_row, +5);
+        break;
+    case EV_SELECT:
+        start_autotune(s_cal_row);
+        break;
+    case EV_BACK:
+        save_settings_to_sd();
+        s_screen = SCREEN_MENU;
+        break;
+    default:
+        break;
+    }
+}
+
 static void ui_handle_event(input_event_t ev)
 {
     if (ev == EV_NONE) {
@@ -1304,6 +1458,10 @@ static void ui_handle_event(input_event_t ev)
     /* The top-right key is a global run/stop: always stops a running profile
      * (safety), and quick-starts from the non-editor screens. */
     if (ev == EV_RUN) {
+        if (s_cal_active) {
+            cancel_autotune();
+            return;
+        }
         if (s_profile_engine.state == PROFILE_ENGINE_STATE_RUNNING) {
             toggle_run();
             s_screen = SCREEN_HOME;
@@ -1337,6 +1495,9 @@ static void ui_handle_event(input_event_t ev)
         break;
     case SCREEN_PINOUT:
         ui_pinout_event(ev);
+        break;
+    case SCREEN_CALIBRATE:
+        ui_calibrate_event(ev);
         break;
     default:
         break;
@@ -1391,11 +1552,11 @@ static void render_menu(void)
 {
     ui_begin_screen("Menu");
     const bool running = (s_profile_engine.state == PROFILE_ENGINE_STATE_RUNNING);
-    int y = 40;
-    const int step = 27;
+    int y = 38;
+    const int step = 24;
     for (int i = 0; i < MENU_COUNT; i++) {
         const char *right = (i == 0) ? (running ? "Stop" : "Run") : "";
-        draw_list_row(y, 24, kMenuItems[i], right, i == s_menu_index, COL_ACCENT);
+        draw_list_row(y, 22, kMenuItems[i], right, i == s_menu_index, COL_ACCENT);
         y += step;
     }
     ui_footer_hint("Up/Down move   Press select   A back   C run/stop");
@@ -1621,6 +1782,60 @@ static void render_pinout(void)
     s_canvas.pushSprite(0, 0);
 }
 
+static void render_calibrate(void)
+{
+    ui_begin_screen("PID Calibrate");
+
+    if (s_cal_active) {
+        const bool top = (s_cal_channel == 0);
+        char buf[40];
+
+        s_canvas.setTextDatum(TL_DATUM);
+        s_canvas.setTextColor(COL_ACCENT, COL_BG);
+        snprintf(buf, sizeof(buf), "Tuning %s heater", top ? "TOP" : "BOTTOM");
+        s_canvas.drawString(buf, 8, 44, 4);
+
+        float temp = top ? s_disp_chamber_c : s_disp_plate_c;
+        s_canvas.setTextColor(COL_TEXT, COL_BG);
+        snprintf(buf, sizeof(buf), "Temp   %d C", (int)(temp + 0.5f));
+        s_canvas.drawString(buf, 8, 84, 4);
+
+        s_canvas.setTextColor(COL_MUTED, COL_BG);
+        snprintf(buf, sizeof(buf), "Target %d C", (int)(s_autotune.config.target_c + 0.5f));
+        s_canvas.drawString(buf, 8, 116, 2);
+        snprintf(buf, sizeof(buf), "Cycle  %d / %d", s_autotune.cycle, s_autotune.config.target_cycles);
+        s_canvas.drawString(buf, 8, 138, 2);
+        float outp = top ? s_disp_top_power : s_disp_bottom_power;
+        snprintf(buf, sizeof(buf), "Output %d%%", (int)(outp + 0.5f));
+        s_canvas.drawString(buf, 8, 160, 2);
+
+        ui_footer_hint("A or C to cancel");
+    } else {
+        char r0[16], r1[16];
+        snprintf(r0, sizeof(r0), "%d C", (int)s_settings.cal_top_target_c);
+        snprintf(r1, sizeof(r1), "%d C", (int)s_settings.cal_bottom_target_c);
+        draw_list_row(46, 24, "Top heater", r0, s_cal_row == 0, COL_ACCENT);
+        draw_list_row(76, 24, "Bottom plate", r1, s_cal_row == 1, COL_ACCENT);
+
+        const int yy = 122;
+        s_canvas.setTextDatum(TL_DATUM);
+        if (s_cal_result_status == PID_AUTOTUNE_DONE) {
+            s_canvas.setTextColor(COL_OK, COL_BG);
+            s_canvas.drawString("Last tune saved:", 8, yy, 2);
+            char g[40];
+            snprintf(g, sizeof(g), "Kp %.2f  Ki %.3f  Kd %.2f", s_cal_kp, s_cal_ki, s_cal_kd);
+            s_canvas.setTextColor(COL_TEXT, COL_BG);
+            s_canvas.drawString(g, 8, yy + 20, 2);
+        } else if (s_cal_result_status == PID_AUTOTUNE_FAILED) {
+            s_canvas.setTextColor(COL_FAULT, COL_BG);
+            s_canvas.drawString("Last tune failed / cancelled", 8, yy, 2);
+        }
+
+        ui_footer_hint("Press start   L/R target   A back");
+    }
+    s_canvas.pushSprite(0, 0);
+}
+
 static void render_current_screen(void)
 {
     switch (s_screen) {
@@ -1644,6 +1859,9 @@ static void render_current_screen(void)
         break;
     case SCREEN_PINOUT:
         render_pinout();
+        break;
+    case SCREEN_CALIBRATE:
+        render_calibrate();
         break;
     default:
         break;
@@ -1711,6 +1929,77 @@ void setup()
     s_last_render_ms = s_last_control_tick_ms;
 }
 
+/* Drives one heater as a relay for the active PID autotune session, keeping the
+ * other heater off and honouring the sensor/over-temp aborts. Publishes the
+ * live values for the calibrate screen and, on completion, stores + applies the
+ * tuned gains. */
+static void run_autotune_tick(float chamber_c, float plate_c, int tc_err, int ntc_err, int plate_implausible)
+{
+    const bool top = (s_cal_channel == 0);
+    float temp = top ? chamber_c : plate_c;
+    int sensor_bad = top ? (tc_err != 0) : (ntc_err != 0 || plate_implausible);
+    float max_c = top ? s_settings.chamber_absolute_max_c : s_settings.plate_absolute_max_c;
+
+    if (sensor_bad || temp > max_c) {
+        s_autotune.status = PID_AUTOTUNE_FAILED;
+    }
+
+    float output = pid_autotune_update(&s_autotune, temp, CONTROL_TICK_MS);
+    pid_autotune_status_t st = pid_autotune_get_status(&s_autotune);
+
+    if (st == PID_AUTOTUNE_RUNNING) {
+        uint32_t on_ms = relay_timing_on_ms(output, RELAY_WINDOW_MS);
+        bool energize = relay_timing_should_energize(s_window_elapsed_ms, on_ms);
+        relay_output_set(top ? energize : false, top ? false : energize);
+    } else {
+        relay_output_force_all_off();
+        output = 0.0f;
+    }
+
+    s_window_elapsed_ms += CONTROL_TICK_MS;
+    if (s_window_elapsed_ms >= RELAY_WINDOW_MS) {
+        s_window_elapsed_ms = 0;
+    }
+
+    s_disp_chamber_c = chamber_c;
+    s_disp_plate_c = plate_c;
+    s_disp_top_power = top ? output : 0.0f;
+    s_disp_bottom_power = top ? 0.0f : output;
+    s_disp_chamber_valid = (tc_err == 0);
+    s_disp_plate_valid = (ntc_err == 0) && !plate_implausible;
+    s_disp_faults = 0;
+    s_disp_target_c = s_autotune.config.target_c;
+
+    if (st != PID_AUTOTUNE_RUNNING) {
+        relay_output_force_all_off();
+        s_cal_active = 0;
+        s_cal_result_status = st;
+        if (st == PID_AUTOTUNE_DONE) {
+            float kp = 0.0f, ki = 0.0f, kd = 0.0f;
+            if (pid_autotune_get_result(&s_autotune, &kp, &ki, &kd)) {
+                s_cal_kp = kp;
+                s_cal_ki = ki;
+                s_cal_kd = kd;
+                if (top) {
+                    s_settings.top_kp = kp;
+                    s_settings.top_ki = ki;
+                    s_settings.top_kd = kd;
+                } else {
+                    s_settings.bottom_kp = kp;
+                    s_settings.bottom_ki = ki;
+                    s_settings.bottom_kd = kd;
+                }
+                apply_heater_settings();
+                save_settings_to_sd();
+            }
+            tone(WIO_BUZZER, 2000, 250);
+        } else {
+            tone(WIO_BUZZER, 300, 400);
+        }
+        s_screen = SCREEN_CALIBRATE;
+    }
+}
+
 static void control_tick(uint32_t ms_since_last)
 {
     thermocouple_reading_t tc_reading;
@@ -1719,6 +2008,11 @@ static void control_tick(uint32_t ms_since_last)
     float plate_temp_c = 0.0f;
     int plate_implausible = 0;
     int ntc_err = plate_ntc_read(&plate_temp_c, &plate_implausible);
+
+    if (s_cal_active) {
+        run_autotune_tick(tc_reading.chamber_temperature_c, plate_temp_c, tc_err, ntc_err, plate_implausible);
+        return;
+    }
 
     profile_engine_tick(&s_profile_engine, (float)CONTROL_TICK_MS / 1000.0f);
 

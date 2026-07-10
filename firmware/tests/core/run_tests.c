@@ -8,6 +8,7 @@
 
 #include "core/heater_control.h"
 #include "core/ntc_convert.h"
+#include "core/pid_autotune.h"
 #include "core/profile_catalog.h"
 #include "core/profile_engine.h"
 #include "core/relay_timing.h"
@@ -318,6 +319,51 @@ static void test_thermal_runaway(void)
     CHECK(thermal_runaway_update(&m, NULL, 1, 25.0f, 100) == 0);
 }
 
+static void test_pid_autotune(void)
+{
+    pid_autotune_config_t cfg = {
+        .target_c = 100.0f,
+        .output_max = 100.0f,
+        .target_cycles = 5,
+        .timeout_ms = 0,
+        .max_safe_c = 0.0f,
+    };
+    pid_autotune_t at;
+    pid_autotune_init(&at, &cfg);
+
+    /* Simulated two-pole thermal plant: the extra lag stage provides the phase
+     * delay needed for the relay to produce a limit cycle around the target. */
+    const float dt = 0.5f; /* 500 ms control ticks */
+    float t1 = 25.0f, t2 = 25.0f;
+    int done = 0;
+    for (int i = 0; i < 200000; i++) {
+        float out = pid_autotune_update(&at, t2, 500);
+        float u = out / 100.0f;
+        t1 += (u * 6.0f - 0.05f * (t1 - 25.0f)) * dt;
+        t2 += (t1 - t2) * 0.10f * dt;
+        if (pid_autotune_get_status(&at) != PID_AUTOTUNE_RUNNING) {
+            done = 1;
+            break;
+        }
+    }
+    CHECK(done == 1);
+    CHECK(pid_autotune_get_status(&at) == PID_AUTOTUNE_DONE);
+
+    float kp = 0.0f, ki = 0.0f, kd = 0.0f;
+    CHECK(pid_autotune_get_result(&at, &kp, &ki, &kd) == 1);
+    CHECK(kp > 0.0f);
+    CHECK(ki > 0.0f);
+    CHECK(kd > 0.0f);
+
+    /* Overtemp guard aborts the tune. */
+    pid_autotune_config_t guarded = cfg;
+    guarded.max_safe_c = 50.0f;
+    pid_autotune_t at2;
+    pid_autotune_init(&at2, &guarded);
+    pid_autotune_update(&at2, 60.0f, 500);
+    CHECK(pid_autotune_get_status(&at2) == PID_AUTOTUNE_FAILED);
+}
+
 static void test_profile_catalog_yaml(void)
 {
     const char *yaml =
@@ -476,6 +522,7 @@ int main(void)
     test_profile_engine();
     test_safety();
     test_thermal_runaway();
+    test_pid_autotune();
     test_profile_catalog_yaml();
     test_ui_local_controller();
 
