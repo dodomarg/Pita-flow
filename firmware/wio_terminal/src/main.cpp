@@ -41,12 +41,12 @@ extern "C" {
 }
 
 /* ---- External hardware pin assignments (Wio Terminal 40-pin header) ---- */
-#define PIN_MAX31855_CLK BCM11
-#define PIN_MAX31855_MISO BCM9
-#define PIN_MAX31855_CS BCM8
-#define PIN_TOP_HEATER_RELAY BCM23
-#define PIN_BOTTOM_HEATER_RELAY BCM24
-#define PIN_PLATE_NTC_ADC RPI_A0
+#define PIN_MAX31855_CLK BCM11         /* header pin 23 */
+#define PIN_MAX31855_MISO BCM9         /* header pin 21 */
+#define PIN_MAX31855_CS BCM8           /* header pin 24 */
+#define PIN_TOP_HEATER_RELAY BCM26     /* top quartz SSR, header pin 37 */
+#define PIN_BOTTOM_HEATER_RELAY BCM27  /* bottom plate relay, header pin 13 */
+#define PIN_PLATE_NTC_ADC RPI_A3       /* plate NTC divider, header pin 18 (BCM24 / A3) */
 
 #define ADC_RESOLUTION_BITS 12
 #define ADC_MAX ((1u << ADC_RESOLUTION_BITS) - 1u)
@@ -61,6 +61,9 @@ extern "C" {
  * far below its setpoint, so steady-state "hold" (heater cycling with little
  * rise) is never mistaken for a stalled/broken heater. */
 #define RUNAWAY_ARM_MARGIN_C 5.0f
+
+/* A new cycle may only begin once both controlled zones are cool. */
+#define COLD_START_MAX_C 50.0f
 
 /* Runtime-adjustable configuration (editable via the on-screen Settings page
  * and persisted to /settings.cfg on the microSD card). Seeded from the
@@ -103,10 +106,11 @@ static app_settings_t s_settings = {
 };
 
 static const ntc_params_t kPlateNtcParams = {
-    .pulldown_resistor_ohm = 4700.0f,
+    .pulldown_resistor_ohm = 10000.0f, /* 10k pull-up to 3.3V (NTC is the low-side leg to GND) */
     .nominal_resistance_ohm = 100000.0f,
     .nominal_temperature_c = 25.0f,
     .beta = 3950.0f,
+    .ntc_low_side = 1,
 };
 
 static const heater_control_config_t kTopHeaterConfig = {
@@ -349,6 +353,18 @@ static const uint16_t COL_BOTTOM = rgb(0, 190, 255);   /* cyan  - bottom plate h
 static const uint16_t COL_OK = rgb(0, 210, 120);       /* green - running */
 static const uint16_t COL_DONE = rgb(0, 170, 255);     /* blue  - complete */
 static const uint16_t COL_FAULT = rgb(255, 70, 70);    /* red   - fault */
+static const uint16_t COL_TARGET = rgb(125, 205, 255); /* target profile */
+
+static const char *s_run_guard_message = NULL;
+static uint32_t s_run_guard_message_until_ms = 0;
+
+static const char *active_run_guard_message(void)
+{
+    if (s_run_guard_message == NULL || (int32_t)(millis() - s_run_guard_message_until_ms) >= 0) {
+        return NULL;
+    }
+    return s_run_guard_message;
+}
 
 static const char *engine_state_label(profile_engine_state_t state)
 {
@@ -442,27 +458,30 @@ static void draw_power_bar(int x, int y, int w, int h, const char *label, float 
     s_canvas.drawString(pct, x + w, y + h / 2, 2);
 }
 
+static void format_mmss(uint32_t seconds, char *out, size_t out_len);
+
 /* Live reflow curve: target profile polyline, grid, run progress marker, and
  * the current chamber temperature plotted against the setpoint curve. */
-static void draw_reflow_curve(int gx, int gy, int gw, int gh, const profile_engine_t *engine, float chamber_c)
+static void draw_reflow_curve(int gx, int gy, int gw, int gh, const reflow_profile_t *profile,
+                              const profile_engine_t *engine, float chamber_c, bool chamber_valid)
 {
     s_canvas.fillRoundRect(gx, gy, gw, gh, 6, COL_PANEL);
     s_canvas.drawRoundRect(gx, gy, gw, gh, 6, COL_PANEL_EDGE);
 
-    const int pad = 6;
-    const int px = gx + pad;
-    const int py = gy + pad;
-    const int pw = gw - 2 * pad;
-    const int ph = gh - 2 * pad;
+    const int px = gx + 28;
+    const int py = gy + 7;
+    const int pw = gw - 34;
+    const int ph = gh - 22;
 
-    /* Light horizontal grid. */
-    for (int i = 1; i < 3; i++) {
-        int yy = py + (ph * i) / 3;
+    for (int i = 0; i <= 2; i++) {
+        int yy = py + (ph * i) / 2;
         s_canvas.drawFastHLine(px, yy, pw, COL_GRID);
     }
 
-    const reflow_profile_t *profile = (engine != NULL) ? engine->active_profile : NULL;
     if (profile == NULL || profile->phase_count == 0) {
+        s_canvas.setTextDatum(MC_DATUM);
+        s_canvas.setTextColor(COL_MUTED, COL_PANEL);
+        s_canvas.drawString("NO PROFILE", gx + gw / 2, gy + gh / 2, 1);
         return;
     }
 
@@ -474,12 +493,34 @@ static void draw_reflow_curve(int gx, int gy, int gw, int gh, const profile_engi
             max_temp = profile->phases[i].target_chamber_c;
         }
     }
-    if (chamber_c > max_temp) max_temp = chamber_c;
+    if (chamber_valid && chamber_c > max_temp) max_temp = chamber_c;
     for (int i = 0; i < s_trace_count; i++) {
         if (s_trace_temp[i] > max_temp) max_temp = s_trace_temp[i];
     }
-    const float temp_span = max_temp * 1.12f + 1.0f; /* headroom above the peak */
+    float temp_span = ceilf((max_temp + 10.0f) / 50.0f) * 50.0f;
+    if (temp_span < 100.0f) temp_span = 100.0f;
     if (total_s == 0) return;
+
+    char axis[16];
+    s_canvas.setTextColor(COL_MUTED, COL_PANEL);
+    s_canvas.setTextDatum(MR_DATUM);
+    snprintf(axis, sizeof(axis), "%dC", (int)temp_span);
+    s_canvas.drawString(axis, px - 3, py + 2, 1);
+    snprintf(axis, sizeof(axis), "%dC", (int)(temp_span / 2.0f));
+    s_canvas.drawString(axis, px - 3, py + ph / 2, 1);
+    s_canvas.drawString("0C", px - 3, py + ph - 1, 1);
+
+    s_canvas.setTextDatum(TL_DATUM);
+    s_canvas.drawString("0:00", px, py + ph + 3, 1);
+    char total_time[12];
+    format_mmss(total_s, total_time, sizeof(total_time));
+    s_canvas.setTextDatum(TR_DATUM);
+    s_canvas.drawString(total_time, px + pw, py + ph + 3, 1);
+
+    s_canvas.setTextColor(COL_TARGET, COL_PANEL);
+    s_canvas.drawString("TGT", px + pw - 28, py + 1, 1);
+    s_canvas.setTextColor(COL_ACCENT, COL_PANEL);
+    s_canvas.drawString("ACT", px + pw, py + 1, 1);
 
     /* Map (time_s, temp_c) into the plot rectangle. */
     auto map_x = [&](float t_s) -> int { return px + (int)((pw - 1) * (t_s / (float)total_s)); };
@@ -498,8 +539,13 @@ static void draw_reflow_curve(int gx, int gy, int gw, int gh, const profile_engi
         t_accum += (float)profile->phases[i].duration_s;
         int cx = map_x(t_accum);
         int cy = map_y(profile->phases[i].target_chamber_c);
-        s_canvas.drawLine(prev_x, prev_y, cx, cy, COL_MUTED);
-        s_canvas.drawLine(prev_x, prev_y + 1, cx, cy + 1, COL_MUTED);
+        if (i + 1 < profile->phase_count) {
+            for (int yy = py + 2; yy < py + ph; yy += 4) {
+                s_canvas.drawPixel(cx, yy, COL_GRID);
+            }
+        }
+        s_canvas.drawLine(prev_x, prev_y, cx, cy, COL_TARGET);
+        s_canvas.drawLine(prev_x, prev_y + 1, cx, cy + 1, COL_TARGET);
         prev_x = cx;
         prev_y = cy;
     }
@@ -522,7 +568,8 @@ static void draw_reflow_curve(int gx, int gy, int gw, int gh, const profile_engi
     }
 
     /* Run progress: elapsed time across completed phases plus the current one. */
-    if (engine->state == PROFILE_ENGINE_STATE_RUNNING || engine->state == PROFILE_ENGINE_STATE_COMPLETE) {
+    if (chamber_valid && engine != NULL && engine->active_profile == profile &&
+        (engine->state == PROFILE_ENGINE_STATE_RUNNING || engine->state == PROFILE_ENGINE_STATE_COMPLETE)) {
         float elapsed_s = engine->elapsed_in_phase_s;
         for (uint32_t i = 0; i < engine->current_phase_index && i < profile->phase_count; i++) {
             elapsed_s += (float)profile->phases[i].duration_s;
@@ -545,7 +592,8 @@ static void format_mmss(uint32_t seconds, char *out, size_t out_len)
 
 static void render_status(const ui_local_status_t *status, const profile_engine_t *engine, float chamber_c,
                            float plate_c, float target_c, float top_power_percent, float bottom_power_percent,
-                           uint32_t faults, bool chamber_valid, bool plate_valid)
+                           uint32_t faults, bool chamber_valid, bool plate_valid,
+                           const reflow_profile_t *graph_profile)
 {
     /* Draw the whole frame off-screen, then blit it in one shot. Clearing and
      * redrawing happen in the hidden buffer, so the visible panel updates
@@ -558,10 +606,22 @@ static void render_status(const ui_local_status_t *status, const profile_engine_
     /* ---- Header: profile name + state pill --------------------------- */
     s_canvas.setTextDatum(TL_DATUM);
     s_canvas.setTextColor(COL_TEXT, COL_BG);
-    s_canvas.drawString(status->selected_profile_name ? status->selected_profile_name : "(no profile)", 8, 6, 2);
+    char profile_title[28];
+    snprintf(profile_title, sizeof(profile_title), "%s", status->selected_profile_name ? status->selected_profile_name
+                                                                                       : "(no profile)");
+    s_canvas.drawString(profile_title, 8, 6, 2);
 
     const char *state_text = fault ? "FAULT" : engine_state_label(status->engine_state);
-    const uint16_t state_col = fault ? COL_FAULT : engine_state_color(status->engine_state);
+    uint16_t state_col = fault ? COL_FAULT : engine_state_color(status->engine_state);
+    if (!fault && status->engine_state == PROFILE_ENGINE_STATE_IDLE) {
+        if (!chamber_valid || !plate_valid) {
+            state_text = "SENSOR";
+            state_col = COL_FAULT;
+        } else if (chamber_c > COLD_START_MAX_C || plate_c > COLD_START_MAX_C) {
+            state_text = "COOLING";
+            state_col = COL_ACCENT;
+        }
+    }
     draw_pill(W - 92, 4, 84, 20, state_text, state_col, COL_BG);
 
     s_canvas.drawFastHLine(0, 28, W, COL_PANEL_EDGE);
@@ -592,10 +652,20 @@ static void render_status(const ui_local_status_t *status, const profile_engine_
     /* Right column: target setpoint + active phase. */
     const int rx = 180;
     s_canvas.setTextColor(COL_MUTED, COL_BG);
-    s_canvas.drawString("TARGET", rx, 34, 1);
-    if (status->engine_state == PROFILE_ENGINE_STATE_RUNNING && target_c > 0.0f) {
+    bool running = (status->engine_state == PROFILE_ENGINE_STATE_RUNNING);
+    float summary_target_c = target_c;
+    if (!running && graph_profile != NULL) {
+        summary_target_c = 0.0f;
+        for (uint32_t i = 0; i < graph_profile->phase_count; i++) {
+            if (graph_profile->phases[i].target_chamber_c > summary_target_c) {
+                summary_target_c = graph_profile->phases[i].target_chamber_c;
+            }
+        }
+    }
+    s_canvas.drawString(running ? "TARGET" : "PROFILE PEAK", rx, 34, 1);
+    if (summary_target_c > 0.0f) {
         char tnum[8];
-        snprintf(tnum, sizeof(tnum), "%d", (int)(target_c + 0.5f));
+        snprintf(tnum, sizeof(tnum), "%d", (int)(summary_target_c + 0.5f));
         s_canvas.setTextColor(COL_TEXT, COL_BG);
         int tx = rx + s_canvas.drawString(tnum, rx, 46, 4);
         draw_degree_unit(tx + 3, 48, 2, 'C', COL_MUTED);
@@ -607,14 +677,22 @@ static void render_status(const ui_local_status_t *status, const profile_engine_
     s_canvas.setTextColor(COL_MUTED, COL_BG);
     s_canvas.drawString("PHASE", rx, 76, 1);
     s_canvas.setTextColor(COL_TEXT, COL_BG);
-    s_canvas.drawString(status->active_phase_name ? status->active_phase_name : "-", rx, 88, 2);
+    if (status->active_phase_name != NULL) {
+        s_canvas.drawString(status->active_phase_name, rx, 88, 2);
+    } else if (graph_profile != NULL) {
+        char phase_count[16];
+        snprintf(phase_count, sizeof(phase_count), "%lu phases", (unsigned long)graph_profile->phase_count);
+        s_canvas.drawString(phase_count, rx, 88, 2);
+    } else {
+        s_canvas.drawString("-", rx, 88, 2);
+    }
 
     /* ---- Reflow curve ------------------------------------------------ */
-    draw_reflow_curve(8, 110, W - 16, 62, engine, chamber_c);
+    draw_reflow_curve(8, 106, W - 16, 70, graph_profile, engine, chamber_c, chamber_valid);
 
     /* ---- Footer: heater power bars + plate temp / elapsed time -------- */
-    draw_power_bar(8, 180, W - 16, 16, "TOP", top_power_percent, COL_ACCENT);
-    draw_power_bar(8, 200, W - 16, 16, "BOT", bottom_power_percent, COL_BOTTOM);
+    draw_power_bar(8, 182, W - 16, 14, "TOP", top_power_percent, COL_ACCENT);
+    draw_power_bar(8, 201, W - 16, 14, "BOT", bottom_power_percent, COL_BOTTOM);
 
     char plate_str[20];
     s_canvas.setTextDatum(ML_DATUM);
@@ -627,11 +705,16 @@ static void render_status(const ui_local_status_t *status, const profile_engine_
         s_canvas.drawString("PLATE Err", 8, 228, 2);
     }
 
+    const char *run_guard = active_run_guard_message();
     if (fault) {
         /* Fault banner takes over the footer-right for maximum legibility. */
         s_canvas.setTextDatum(MR_DATUM);
         s_canvas.setTextColor(COL_FAULT, COL_BG);
         s_canvas.drawString(primary_fault_name(faults), W - 8, 228, 2);
+    } else if (run_guard != NULL) {
+        s_canvas.setTextDatum(MR_DATUM);
+        s_canvas.setTextColor(COL_ACCENT, COL_BG);
+        s_canvas.drawString(run_guard, W - 8, 228, 2);
     } else if (engine != NULL && engine->active_profile != NULL &&
                (status->engine_state == PROFILE_ENGINE_STATE_RUNNING ||
                 status->engine_state == PROFILE_ENGINE_STATE_COMPLETE)) {
@@ -710,6 +793,7 @@ static int s_cal_channel = 0; /* 0 = top heater, 1 = bottom plate */
 static int s_cal_row = 0;     /* selected channel row on the calibrate screen */
 static pid_autotune_t s_autotune;
 static pid_autotune_status_t s_cal_result_status = PID_AUTOTUNE_RUNNING;
+static uint32_t s_cal_failure_faults = SAFETY_FAULT_NONE;
 static float s_cal_kp = 0.0f, s_cal_ki = 0.0f, s_cal_kd = 0.0f;
 
 static const char *const kMenuItems[] = {"Run / Stop", "Select Profile", "Edit Profile", "New Profile",
@@ -907,17 +991,17 @@ static void apply_heater_settings(void)
 
 /* ---- Shared engine helpers -------------------------------------------- */
 
-static bool engine_is_idle_or_complete(void)
+static bool engine_can_change_profile(void)
 {
-    return s_profile_engine.state == PROFILE_ENGINE_STATE_IDLE ||
-           s_profile_engine.state == PROFILE_ENGINE_STATE_COMPLETE;
+    return s_profile_engine.state != PROFILE_ENGINE_STATE_RUNNING && !s_cal_active;
 }
 
-/* Loads the currently selected catalog profile into the engine while idle so
- * the home screen graph reflects the selection before a run is started. */
+/* Loads the selected profile whenever no run/calibration is active. This also
+ * allows selecting a profile after a fault: profile_engine_load() replaces the
+ * active-profile pointer used by the graph and returns the engine to IDLE. */
 static void sync_idle_engine_profile(void)
 {
-    if (!engine_is_idle_or_complete()) {
+    if (!engine_can_change_profile()) {
         return;
     }
     const reflow_profile_t *p = profile_catalog_get(&s_catalog, s_ui_controller.selected_profile_index);
@@ -932,9 +1016,26 @@ static void toggle_run(void)
     if (s_cal_active) {
         return; /* ignore run requests while a calibration is in progress */
     }
+
+    if (s_profile_engine.state != PROFILE_ENGINE_STATE_RUNNING) {
+        const char *blocked = NULL;
+        if (!s_disp_chamber_valid || !s_disp_plate_valid) {
+            blocked = "CHECK BOTH SENSORS";
+        } else if (s_disp_chamber_c > COLD_START_MAX_C || s_disp_plate_c > COLD_START_MAX_C) {
+            blocked = "COOL BELOW 50C";
+        }
+        if (blocked != NULL) {
+            s_run_guard_message = blocked;
+            s_run_guard_message_until_ms = millis() + 4000;
+            tone(WIO_BUZZER, 300, 180);
+            return;
+        }
+    }
+
     ui_local_notification_t n = ui_local_controller_handle_button(&s_ui_controller, UI_LOCAL_BUTTON_SELECT,
                                                                   &s_profile_engine, s_catalog.profiles);
     if (n != UI_LOCAL_NOTIFICATION_NONE) {
+        s_run_guard_message = NULL;
         play_notification_tone(n);
     }
 }
@@ -954,8 +1055,11 @@ static void start_autotune(int channel)
     pid_autotune_init(&s_autotune, &cfg);
     s_cal_active = 1;
     s_cal_result_status = PID_AUTOTUNE_RUNNING;
+    s_cal_failure_faults = SAFETY_FAULT_NONE;
     heater_control_reset(&s_top_heater_ctrl);
     heater_control_reset(&s_bottom_heater_ctrl);
+    thermal_runaway_reset(&s_top_runaway);
+    thermal_runaway_reset(&s_bottom_runaway);
     reset_temperature_trace();
     tone(WIO_BUZZER, 1500, 80);
 }
@@ -967,6 +1071,7 @@ static void cancel_autotune(void)
     }
     s_cal_active = 0;
     s_cal_result_status = PID_AUTOTUNE_FAILED;
+    s_cal_failure_faults = SAFETY_FAULT_NONE;
     relay_output_force_all_off();
     heater_control_reset(&s_top_heater_ctrl);
     heater_control_reset(&s_bottom_heater_ctrl);
@@ -1544,8 +1649,14 @@ static void render_home(void)
 {
     ui_local_status_t status;
     ui_local_controller_snapshot(&s_ui_controller, &s_profile_engine, s_catalog.profiles, &status);
+    const reflow_profile_t *graph_profile = NULL;
+    if (s_profile_engine.state == PROFILE_ENGINE_STATE_RUNNING) {
+        graph_profile = s_profile_engine.active_profile;
+    } else {
+        graph_profile = profile_catalog_get(&s_catalog, s_ui_controller.selected_profile_index);
+    }
     render_status(&status, &s_profile_engine, s_disp_chamber_c, s_disp_plate_c, s_disp_target_c, s_disp_top_power,
-                  s_disp_bottom_power, s_disp_faults, s_disp_chamber_valid, s_disp_plate_valid);
+                  s_disp_bottom_power, s_disp_faults, s_disp_chamber_valid, s_disp_plate_valid, graph_profile);
 }
 
 static void render_menu(void)
@@ -1772,11 +1883,11 @@ static void render_pinout(void)
     row("CS", "BCM8 / pin24", 94);
 
     section("Plate NTC", 116);
-    row("ADC in", "A0", 134);
+    row("ADC in", "BCM24 / pin18", 134);
 
     section("Heaters", 156);
-    row("Top SSR", "BCM23 / pin16", 174);
-    row("Bottom relay", "BCM24 / pin18", 192);
+    row("Top SSR", "BCM26 / pin37", 174);
+    row("Bottom relay", "BCM27 / pin13", 192);
 
     ui_footer_hint("A back   -   Wio Terminal 40-pin header");
     s_canvas.pushSprite(0, 0);
@@ -1809,6 +1920,18 @@ static void render_calibrate(void)
         snprintf(buf, sizeof(buf), "Output %d%%", (int)(outp + 0.5f));
         s_canvas.drawString(buf, 8, 160, 2);
 
+        const thermal_runaway_monitor_t *monitor = top ? &s_top_runaway : &s_bottom_runaway;
+        if (monitor->armed) {
+            s_canvas.setTextColor(COL_ACCENT, COL_BG);
+            snprintf(buf, sizeof(buf), "EXPECT RISE  %lu / %lu s",
+                     (unsigned long)(monitor->elapsed_ms / 1000),
+                     (unsigned long)(s_settings.runaway_window_ms / 1000));
+        } else {
+            s_canvas.setTextColor(COL_MUTED, COL_BG);
+            snprintf(buf, sizeof(buf), "Rise guard waiting");
+        }
+        s_canvas.drawString(buf, 8, 182, 2);
+
         ui_footer_hint("A or C to cancel");
     } else {
         char r0[16], r1[16];
@@ -1828,7 +1951,10 @@ static void render_calibrate(void)
             s_canvas.drawString(g, 8, yy + 20, 2);
         } else if (s_cal_result_status == PID_AUTOTUNE_FAILED) {
             s_canvas.setTextColor(COL_FAULT, COL_BG);
-            s_canvas.drawString("Last tune failed / cancelled", 8, yy, 2);
+            const char *message = (s_cal_failure_faults & SAFETY_FAULT_THERMAL_RUNAWAY)
+                                      ? "THERMAL RUNAWAY - NO TEMP RISE"
+                                      : "Last tune failed / cancelled";
+            s_canvas.drawString(message, 8, yy, 2);
         }
 
         ui_footer_hint("Press start   L/R target   A back");
@@ -1945,6 +2071,22 @@ static void run_autotune_tick(float chamber_c, float plate_c, int tc_err, int nt
     }
 
     float output = pid_autotune_update(&s_autotune, temp, CONTROL_TICK_MS);
+
+    /* Autotune bypasses normal profile control, so it needs its own no-rise
+     * guard. Cooling half-cycles intentionally disarm the monitor. */
+    const thermal_runaway_config_t runaway_cfg = {
+        .min_rise_c = s_settings.runaway_min_rise_c,
+        .window_ms = s_settings.runaway_window_ms,
+    };
+    int heating_expected = !sensor_bad && output > 0.0f &&
+                           (s_autotune.config.target_c - temp) > RUNAWAY_ARM_MARGIN_C;
+    thermal_runaway_monitor_t *monitor = top ? &s_top_runaway : &s_bottom_runaway;
+    if (thermal_runaway_update(monitor, &runaway_cfg, heating_expected, temp, CONTROL_TICK_MS)) {
+        s_cal_failure_faults |= SAFETY_FAULT_THERMAL_RUNAWAY;
+        s_autotune.status = PID_AUTOTUNE_FAILED;
+        output = 0.0f;
+    }
+
     pid_autotune_status_t st = pid_autotune_get_status(&s_autotune);
 
     if (st == PID_AUTOTUNE_RUNNING) {
@@ -1967,13 +2109,16 @@ static void run_autotune_tick(float chamber_c, float plate_c, int tc_err, int nt
     s_disp_bottom_power = top ? 0.0f : output;
     s_disp_chamber_valid = (tc_err == 0);
     s_disp_plate_valid = (ntc_err == 0) && !plate_implausible;
-    s_disp_faults = 0;
+    s_disp_faults = s_cal_failure_faults;
     s_disp_target_c = s_autotune.config.target_c;
 
     if (st != PID_AUTOTUNE_RUNNING) {
         relay_output_force_all_off();
         s_cal_active = 0;
         s_cal_result_status = st;
+        if (s_cal_failure_faults != SAFETY_FAULT_NONE) {
+            profile_engine_force_fault(&s_profile_engine);
+        }
         if (st == PID_AUTOTUNE_DONE) {
             float kp = 0.0f, ki = 0.0f, kd = 0.0f;
             if (pid_autotune_get_result(&s_autotune, &kp, &ki, &kd)) {
@@ -2063,8 +2208,12 @@ static void control_tick(uint32_t ms_since_last)
         if (phase->top_heater_enabled) {
             top_power_percent =
                 heater_control_update(&s_top_heater_ctrl, tc_reading.chamber_temperature_c, target_c, dt_s);
+            /* The ramped target can stay less than the arming margin ahead of
+             * the measurement forever. Use the final phase target to decide
+             * whether temperature rise is still physically expected. */
             top_heating_expected = (top_power_percent > 0.0f) &&
-                                   ((target_c - tc_reading.chamber_temperature_c) > RUNAWAY_ARM_MARGIN_C);
+                                   ((phase->target_chamber_c - tc_reading.chamber_temperature_c) >
+                                    RUNAWAY_ARM_MARGIN_C);
         } else {
             heater_control_reset(&s_top_heater_ctrl);
         }

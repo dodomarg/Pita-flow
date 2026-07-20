@@ -21,13 +21,24 @@ int ntc_convert_adc_to_celsius(uint32_t raw_adc,
      * => R_ntc = R_pulldown * (adc_max - raw_adc) / raw_adc
      */
     if (raw_adc == 0 || raw_adc >= adc_max) {
-        /* Open (raw_adc == 0, division by zero) or shorted (raw_adc == adc_max,
-         * would compute R_ntc == 0) sensor. */
+        /* Open or shorted sensor (division by zero or R_ntc == 0 at a rail). */
         return -1;
     }
 
-    float ratio = (float)(adc_max - raw_adc) / (float)raw_adc;
-    float r_ntc = params->pulldown_resistor_ohm * ratio;
+    float r_ntc;
+    if (params->ntc_low_side) {
+        /* Vcc -- R_pullup -- node -- NTC -- gnd
+         * raw_adc / adc_max = R_ntc / (R_ntc + R_pullup)
+         * => R_ntc = R_pullup * raw_adc / (adc_max - raw_adc)
+         */
+        r_ntc = params->pulldown_resistor_ohm * (float)raw_adc / (float)(adc_max - raw_adc);
+    } else {
+        /* Vcc -- ntc -- node -- R_pulldown -- gnd
+         * raw_adc / adc_max = R_pulldown / (R_ntc + R_pulldown)
+         * => R_ntc = R_pulldown * (adc_max - raw_adc) / raw_adc
+         */
+        r_ntc = params->pulldown_resistor_ohm * (float)(adc_max - raw_adc) / (float)raw_adc;
+    }
 
     if (r_ntc <= 0.0f) {
         return -1;

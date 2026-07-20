@@ -75,6 +75,19 @@ static void test_ntc_convert(void)
     CHECK(ntc_reading_is_implausible(4095, 4095, 10) == 1);
     CHECK(ntc_reading_is_implausible(5, 4095, 10) == 1);
     CHECK(ntc_reading_is_implausible(2048, 4095, 10) == 0);
+
+    /* Low-side (pull-up) wiring: at the balance point R_ntc == R_pullup, so the
+     * temperature is the nominal temperature, and higher raw now means COLDER. */
+    ntc_params_t low = params;
+    low.ntc_low_side = 1;
+    float low_balance_c = 0.0f;
+    CHECK(ntc_convert_adc_to_celsius(2048, 4095, &low, &low_balance_c) == 0);
+    CHECK_NEAR(low_balance_c, 25.0f, 0.5f);
+
+    float low_hot_c = 0.0f, low_cold_c = 0.0f;
+    CHECK(ntc_convert_adc_to_celsius(1000, 4095, &low, &low_hot_c) == 0);
+    CHECK(ntc_convert_adc_to_celsius(3000, 4095, &low, &low_cold_c) == 0);
+    CHECK(low_hot_c > low_cold_c);
 }
 
 static void test_relay_timing(void)
@@ -188,6 +201,7 @@ static void test_profile_engine(void)
     /* Finish phase 1 (5s total) and confirm completion. */
     profile_engine_tick(&engine, 2.0f);
     CHECK(engine.state == PROFILE_ENGINE_STATE_COMPLETE);
+    CHECK(profile_engine_current_phase(&engine) == NULL);
 
     /* Fault handling. */
     profile_engine_force_fault(&engine);

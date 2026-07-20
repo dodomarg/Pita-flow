@@ -105,7 +105,7 @@ const profile_phase_t *profile_engine_current_phase(const profile_engine_t *engi
     if (engine == NULL || engine->active_profile == NULL) {
         return NULL;
     }
-    if (engine->state != PROFILE_ENGINE_STATE_RUNNING && engine->state != PROFILE_ENGINE_STATE_COMPLETE) {
+    if (engine->state != PROFILE_ENGINE_STATE_RUNNING) {
         return NULL;
     }
     if (engine->current_phase_index >= engine->active_profile->phase_count) {

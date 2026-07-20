@@ -19,10 +19,17 @@ extern "C" {
  * the recommended pulldown resistor value.
  */
 typedef struct {
-    float pulldown_resistor_ohm;   /* Fixed low-side (pulldown) divider resistor value */
+    float pulldown_resistor_ohm;   /* Fixed series divider resistor value (low- or high-side leg) */
     float nominal_resistance_ohm; /* NTC resistance at nominal_temperature_c (typically 100000 @ 25C) */
     float nominal_temperature_c;  /* Nominal temperature for nominal_resistance_ohm, typically 25.0 */
     float beta;                   /* Beta coefficient of the thermistor, e.g. 3950 */
+    /* Divider orientation. 0 (default): NTC is the HIGH-side leg (to Vcc) and
+     * pulldown_resistor_ohm is the low-side leg to GND, so higher temperature
+     * (lower NTC resistance) gives a HIGHER raw ADC reading. 1: NTC is the
+     * LOW-side leg (to GND) and pulldown_resistor_ohm is a pull-UP to Vcc (the
+     * common heater-thermistor wiring), so higher temperature gives a LOWER
+     * raw ADC reading. */
+    int ntc_low_side;
 } ntc_params_t;
 
 /**
